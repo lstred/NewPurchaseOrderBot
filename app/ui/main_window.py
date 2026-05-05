@@ -8,12 +8,11 @@ import sys
 from datetime import date, timedelta
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize, QTimer
-from PyQt6.QtGui import QFont, QIcon, QAction
+from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QTimer, QDate
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QPushButton, QStatusBar, QDateEdit, QFrame,
-    QMessageBox, QSizePolicy, QToolBar, QMenu,
+    QMessageBox,
 )
 
 from app.services.metrics_service import DatasetBundle, compute_all
@@ -137,9 +136,7 @@ class MainWindow(QMainWindow):
         self._date_start.setCalendarPopup(True)
         default_start = date(2025, 8, 4)
         self._date_start.setDate(
-            __import__("PyQt6.QtCore", fromlist=["QDate"]).QDate(
-                default_start.year, default_start.month, default_start.day
-            )
+            QDate(default_start.year, default_start.month, default_start.day)
         )
         lay.addWidget(self._date_start)
 
@@ -149,9 +146,7 @@ class MainWindow(QMainWindow):
         self._date_end.setCalendarPopup(True)
         today = date.today()
         self._date_end.setDate(
-            __import__("PyQt6.QtCore", fromlist=["QDate"]).QDate(
-                today.year, today.month, today.day
-            )
+            QDate(today.year, today.month, today.day)
         )
         lay.addWidget(self._date_end)
 
@@ -199,7 +194,6 @@ class MainWindow(QMainWindow):
         self._btn_refresh.setText("Loading…")
         self._set_status("Loading data…")
 
-        from PyQt6.QtCore import QDate
         qs = self._date_start.date()
         qe = self._date_end.date()
         start = date(qs.year(), qs.month(), qs.day())

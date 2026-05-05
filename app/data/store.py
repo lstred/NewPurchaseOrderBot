@@ -130,31 +130,40 @@ def is_snoozed(alert_key: str, current_po_qty: float = 0.0) -> bool:
     if not entry:
         return False
 
-    # Snooze until date
+    # Auto-unsnooze if PO qty has changed (always checked first)
+    saved_qty = entry.get("po_qty_at_snooze", 0.0)
+    if abs(current_po_qty - saved_qty) > 0.01:
+        unsnooze_alert(alert_key)
+        return False
+
+    # Date-based snooze
     until = entry.get("until")
-    if until:
+    if until is not None:
         try:
             until_d = date.fromisoformat(until)
             if date.today() <= until_d:
                 return True
+            # Expired — clean up
+            unsnooze_alert(alert_key)
+            return False
         except ValueError:
             pass
 
-    # Snooze until PO qty changes
-    saved_qty = entry.get("po_qty_at_snooze", 0.0)
-    if abs(current_po_qty - saved_qty) > 0.01:
-        # PO qty changed — auto-unsnooze
-        unsnooze_alert(alert_key)
-        return False
-
-    # Expired
-    return False
+    # "Until PO qty changes" mode (until=None) — qty hasn't changed, still snoozed
+    return True
 
 
 def unsnooze_alert(alert_key: str) -> None:
     data = _load(_SNOOZE_FILE)
     data.pop(alert_key, None)
     _save(_SNOOZE_FILE, data)
+
+
+def delete_target(key: str) -> None:
+    """Remove a stock-turn target by key."""
+    data = _load(_TARGETS_FILE)
+    data.pop(key, None)
+    _save(_TARGETS_FILE, data)
 
 
 def get_all_snoozes() -> dict[str, Any]:

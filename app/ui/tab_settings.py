@@ -10,17 +10,14 @@ from typing import Optional
 import pandas as pd
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QComboBox, QDoubleSpinBox,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, 
     QPushButton, QScrollArea, QVBoxLayout, QWidget, QFrame,
-    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 
-from app.data.store import get_all_targets, set_target, get_all_launch_dates, set_launch_date
+from app.data.store import get_all_targets, set_target, delete_target, get_all_launch_dates
 from app.ui.widgets import SectionTitle, HSep, DataTable
 import app.ui.theme as theme
-
-from datetime import date
 
 
 class SettingsTab(QWidget):
@@ -78,16 +75,22 @@ class SettingsTab(QWidget):
 
         # Current targets table
         cl.addWidget(QLabel("All Configured Targets:"))
-        self._targets_table = DataTable(["Key", "Level", "Value", "Target Turn", ""])
-        self._targets_table.setMaximumHeight(240)
+        self._targets_table = DataTable(["Key", "Level", "Value", "Target Turn"])
+        self._targets_table.setMaximumHeight(220)
         cl.addWidget(self._targets_table)
+
+        del_btn = QPushButton("Delete Selected Target")
+        del_btn.setObjectName("danger")
+        del_btn.setFixedWidth(200)
+        del_btn.clicked.connect(self._delete_selected_target)
+        cl.addWidget(del_btn)
         self._refresh_targets_table()
 
         cl.addWidget(HSep())
 
         # Launch dates override
         cl.addWidget(QLabel("Override Launch Dates (leave blank to use auto-detected date):"))
-        self._launch_table = DataTable(["SKU", "Current Launch Date", "Override"])
+        self._launch_table = DataTable(["SKU", "Auto-Detected Launch Date"])
         self._launch_table.setMaximumHeight(200)
         cl.addWidget(self._launch_table)
 
@@ -164,12 +167,21 @@ class SettingsTab(QWidget):
             else:
                 level_label = "Global"
                 value = "—"
-            rows.append([key, level_label, value, f"{val:.1f}x", "Delete"])
+            rows.append([key, level_label, value, f"{val:.1f}x"])
         self._targets_table.populate(rows)
+
+    def _delete_selected_target(self) -> None:
+        selected = self._targets_table.selectedItems()
+        if not selected:
+            return
+        row = self._targets_table.currentRow()
+        key_item = self._targets_table.item(row, 0)
+        if key_item:
+            key = key_item.text()
+            delete_target(key)
+            self._refresh_targets_table()
 
     def _refresh_launch_table(self) -> None:
         launch_dates = get_all_launch_dates()
-        rows = []
-        for sku, d in sorted(launch_dates.items()):
-            rows.append([sku, str(d), ""])
+        rows = [[sku, str(d)] for sku, d in sorted(launch_dates.items())]
         self._launch_table.populate(rows)

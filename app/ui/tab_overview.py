@@ -172,10 +172,10 @@ class OverviewTab(QWidget):
             return df
         q = filters.get("sku_search", "").strip().upper()
         if q:
-            df = df[
-                df["sku"].str.upper().str.contains(q, na=False)
-                | df.get("sku_description", pd.Series(dtype=str)).str.upper().str.contains(q, na=False)
-            ]
+            sku_match = df["sku"].str.upper().str.contains(q, na=False)
+            if "sku_description" in df.columns:
+                sku_match = sku_match | df["sku_description"].str.upper().str.contains(q, na=False)
+            df = df[sku_match]
         if filters.get("cost_centers"):
             df = df[df["cost_center"].isin(filters["cost_centers"])]
         if filters.get("suppliers"):

@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QCheckBox,
 )
 
-from app.data.store import snooze_alert, is_snoozed, get_all_snoozes, unsnooze_alert
+from app.data.store import snooze_alert, is_snoozed, unsnooze_alert
 from app.services.metrics_service import DatasetBundle
 from app.ui.widgets import FilterSidebar, SectionTitle, HSep
 import app.ui.theme as theme

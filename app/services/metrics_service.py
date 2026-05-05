@@ -410,15 +410,11 @@ def _build_timelines(
         # If no POs and will stock out: show next reorder point
         if not po_events.get(sku):
             days_left = inv_sy / avg_daily if avg_daily > 0 else _INF
-            for rec in records:
-                idx = records.index(rec)
-                if idx == int(days_left):
-                    rec["reorder_point"] = True
-                else:
-                    rec["reorder_point"] = False
-                rec["hypothetical_receipt"] = (
-                    True if idx == int(days_left) + lead_time else False
-                )
+            reorder_idx = int(days_left) if days_left < _INF else -1
+            receipt_idx = reorder_idx + lead_time if reorder_idx >= 0 else -1
+            for idx, rec in enumerate(records):
+                rec["reorder_point"] = (idx == reorder_idx)
+                rec["hypothetical_receipt"] = (idx == receipt_idx)
         else:
             for rec in records:
                 rec["reorder_point"] = False
