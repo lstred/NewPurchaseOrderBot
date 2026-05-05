@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 from app.data.store import snooze_alert, is_snoozed, unsnooze_alert
 from app.services.metrics_service import DatasetBundle
 from app.ui.widgets import FilterSidebar, SectionTitle, HSep
+from app.ui.timeline_popup import TimelineDialog
 import app.ui.theme as theme
 
 
@@ -32,7 +33,8 @@ _ALERT_TYPES = {
 
 
 class AlertCard(QFrame):
-    snoozed = pyqtSignal(str, str)  # alert_key, duration
+    snoozed = pyqtSignal(str, str)          # alert_key, "snoozed"
+    timeline_requested = pyqtSignal(str)    # sku
 
     def __init__(self, alert_type: str, row: pd.Series, parent=None):
         super().__init__(parent)
@@ -69,6 +71,14 @@ class AlertCard(QFrame):
         snooze_btn.setFixedWidth(70)
         snooze_btn.clicked.connect(self._show_snooze_dialog)
         title_row.addWidget(snooze_btn)
+
+        timeline_btn = QPushButton("📈 Timeline")
+        timeline_btn.setObjectName("flat")
+        timeline_btn.setFixedWidth(90)
+        timeline_btn.setToolTip("View 180-day inventory projection for this SKU")
+        timeline_btn.clicked.connect(lambda: self.timeline_requested.emit(self._sku))
+        title_row.addWidget(timeline_btn)
+
         lay.addLayout(title_row)
 
         # SKU + description
@@ -246,6 +256,7 @@ class ProblemAreasTab(QWidget):
                         continue
                     card = AlertCard(alert_type, row)
                     card.snoozed.connect(lambda key, _: self._on_snoozed(key))
+                    card.timeline_requested.connect(self._on_timeline_requested)
                     self._alert_layout.insertWidget(self._alert_layout.count() - 1, card)
                     cards_added += 1
 
@@ -256,6 +267,7 @@ class ProblemAreasTab(QWidget):
                 if not is_snoozed(alert_key, 0.0):
                     card = AlertCard("aging", row)
                     card.snoozed.connect(lambda key, _: self._on_snoozed(key))
+                    card.timeline_requested.connect(self._on_timeline_requested)
                     self._alert_layout.insertWidget(self._alert_layout.count() - 1, card)
                     cards_added += 1
 
@@ -264,6 +276,11 @@ class ProblemAreasTab(QWidget):
     def _on_snoozed(self, _key: str) -> None:
         if self._bundle:
             self._render(self._bundle.sku_metrics)
+
+    def _on_timeline_requested(self, sku: str) -> None:
+        if self._bundle is not None:
+            dlg = TimelineDialog(sku, self._bundle, self)
+            dlg.show()
 
     def _apply_filters(self, df: pd.DataFrame, filters: dict) -> pd.DataFrame:
         if df is None or df.empty:

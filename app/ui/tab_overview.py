@@ -20,6 +20,7 @@ from app.ui.widgets import (
     DataTable, FilterSidebar, KpiCard, SectionTitle, HSep, make_badge,
 )
 from app.ui.overview_dialogs import ColumnManagerDialog, ThresholdRulesDialog
+from app.ui.timeline_popup import TimelineDialog
 import app.ui.theme as theme
 
 
@@ -121,6 +122,8 @@ class OverviewTab(QWidget):
         ]
         self._table = DataTable(self._table_cols)
         self._table.cellDoubleClicked.connect(self._on_row_double_clicked)
+        # Single-click tooltip hint
+        self._table.setToolTip("Double-click any row to view its inventory timeline")
         cl.addWidget(self._table)
 
         root.addWidget(content)
@@ -224,8 +227,11 @@ class OverviewTab(QWidget):
 
     def _on_row_double_clicked(self, row: int, _col: int) -> None:
         item = self._table.item(row, 0)
-        if item:
-            self.sku_selected.emit(item.text())
+        if item and self._bundle is not None:
+            sku = item.text()
+            dlg = TimelineDialog(sku, self._bundle, self)
+            dlg.open_in_tab.connect(self.sku_selected)
+            dlg.show()
 
     # ------------------------------------------------------------------
     # Persisted table settings

@@ -461,7 +461,7 @@ Plus a group-level summary row per price class.
 | Rule | Detail |
 |---|---|
 | Active inventory items | `ITEM.IINVEN = 'Y'` |
-| Exclude discontinued items | `ITEM.IDISCD` is null / blank / `'0'` |
+| Exclude discontinued items | `LEN(LTRIM(RTRIM(CAST(ITEM.IDISCD AS VARCHAR)))) < 2` (null, blank, or single char like `'0'`) |
 | Dropped items | `ITEM.IPOL1` or `IPOL2` or `IPOL3 = 'DI'` AND `IDISCD > 0` |
 | Sales orders (customer) | `_ORDERS.ACCOUNT#I > 1` |
 | Purchase orders (warehouse) | `_ORDERS.ACCOUNT#I = 1` |
@@ -560,8 +560,10 @@ NewPurchBot/
       tab_overview.py        — Overview tab: 6 KPI cards + 21-column SKU table
       tab_timeline.py        — Inventory Timeline: 180-day Plotly projection per SKU
       tab_fillrate.py        — Fill Rate: histogram + per-SKU table
-      tab_problems.py        — Problem Areas: alert cards with snooze
+      tab_problems.py        — Problem Areas: alert cards with snooze + Timeline button
       tab_settings.py        — Settings: stock-turn targets at all filter levels
+      timeline_popup.py      — Reusable TimelineDialog popup (used from Overview + Problems)
+      overview_dialogs.py    — ColumnManagerDialog + ThresholdRulesDialog for Overview table
       __init__.py
 ```
 
@@ -667,7 +669,9 @@ All JSON files stored at `%APPDATA%\PurchaseOrderBot\`:
 | Snooze "until PO qty changes" never stuck | `store.py` | `is_snoozed()` fell through to `return False` after PO qty check | Reordered: check PO qty change first (unsnooze if changed), then check date, then return `True` for indefinite snooze |
 | Timeline reorder markers on wrong day | `metrics_service.py` | `records.index(rec)` finds first match, breaks on duplicate dict values | Replaced with `enumerate(records)` |
 | `QDate` imported inline via `__import__` | `main_window.py` | Leftover hack from development | Moved to proper top-level `from PyQt6.QtCore import QDate` |
-| `df.get("sku_description", pd.Series(...))` length mismatch | `tab_overview.py` | `pd.Series` fallback has length 1, not len(df) | Guarded with `if "sku_description" in df.columns` |
+| IDISCD filter changed from `IN ('','0')` to `LEN < 2` | `queries.py` | Any 1-character IDISCD value (not just `'0'`) should be treated as not discontinued | Changed both ITEMS_SQL and FILTER_VALUES_SQL to `LEN(LTRIM(RTRIM(CAST(i.IDISCD AS VARCHAR)))) < 2` |
+| `sku_selected` double-click now shows timeline popup | `tab_overview.py` | User wanted click-to-popup timeline without leaving the overview | Changed `_on_row_double_clicked` to open `TimelineDialog`; popup has "Open in Timeline Tab" button to still navigate |
+| Timeline popup added to Problem Areas | `tab_problems.py` | User wanted timeline accessible from alert cards | Added `timeline_requested` signal to `AlertCard`, "📈 Timeline" button, wired to `TimelineDialog` in `ProblemAreasTab` |
 
 ---
 

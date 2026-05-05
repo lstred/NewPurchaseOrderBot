@@ -29,7 +29,7 @@ LEFT JOIN dbo.PRODLINE pl
        ON LTRIM(RTRIM(pl.[LPROD#])) = LTRIM(RTRIM(i.IPRODL))
       AND LTRIM(RTRIM(pl.[LMFGR#])) = LTRIM(RTRIM(i.IMFGR))
 WHERE i.IINVEN = 'Y'
-  AND (i.IDISCD IS NULL OR LTRIM(RTRIM(CAST(i.IDISCD AS VARCHAR))) IN ('', '0'))
+  AND (i.IDISCD IS NULL OR LEN(LTRIM(RTRIM(CAST(i.IDISCD AS VARCHAR)))) < 2)
 """
 
 # ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ LEFT JOIN dbo.PRODLINE pl
        ON LTRIM(RTRIM(pl.[LPROD#])) = LTRIM(RTRIM(i.IPRODL))
       AND LTRIM(RTRIM(pl.[LMFGR#])) = LTRIM(RTRIM(i.IMFGR))
 WHERE i.IINVEN = 'Y'
-  AND (i.IDISCD IS NULL OR LTRIM(RTRIM(CAST(i.IDISCD AS VARCHAR))) IN ('', '0'))
+  AND (i.IDISCD IS NULL OR LEN(LTRIM(RTRIM(CAST(i.IDISCD AS VARCHAR)))) < 2)
 """
 
 # ---------------------------------------------------------------------------
