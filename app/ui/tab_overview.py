@@ -4,6 +4,7 @@ Overview tab — portfolio KPI summary + per-SKU table.
 
 from __future__ import annotations
 
+import math
 from datetime import date
 from typing import Optional
 
@@ -18,7 +19,19 @@ from app.services.metrics_service import DatasetBundle
 from app.ui.widgets import (
     DataTable, FilterSidebar, KpiCard, SectionTitle, HSep, make_badge,
 )
+from app.ui.overview_dialogs import ColumnManagerDialog, ThresholdRulesDialog
 import app.ui.theme as theme
+
+
+def _safe_days(v) -> str:
+    """Safely format a days-since value that may be None or float NaN."""
+    if v is None:
+        return "—"
+    try:
+        f = float(v)
+        return "—" if math.isnan(f) else str(int(f))
+    except (TypeError, ValueError):
+        return "—"
 
 
 class OverviewTab(QWidget):
@@ -79,6 +92,25 @@ class OverviewTab(QWidget):
         row.addWidget(self._lbl_count)
         cl.addLayout(row)
 
+        # Table controls toolbar
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(8)
+
+        btn_cols = QPushButton("⚙  Columns")
+        btn_cols.setObjectName("flat")
+        btn_cols.setToolTip("Show, hide, or reorder table columns")
+        btn_cols.clicked.connect(self._open_column_manager)
+        ctrl.addWidget(btn_cols)
+
+        btn_rules = QPushButton("◈  Color Rules")
+        btn_rules.setObjectName("flat")
+        btn_rules.setToolTip("Define threshold-based row and cell highlight rules")
+        btn_rules.clicked.connect(self._open_rules_dialog)
+        ctrl.addWidget(btn_rules)
+
+        ctrl.addStretch()
+        cl.addLayout(ctrl)
+
         # Table
         self._table_cols = [
             "SKU", "Description", "Price Class", "Cost Center", "Rating",
@@ -102,7 +134,9 @@ class OverviewTab(QWidget):
         if bundle.filter_values is not None and not bundle.filter_values.empty:
             self._sidebar.populate(bundle.filter_values)
         self._refresh_kpis(bundle.summary)
+        self._apply_saved_rules()          # load before populate so colors apply
         self._refresh_table(bundle.sku_metrics)
+        self._apply_saved_column_prefs()   # restore hidden cols after populate
 
     def apply_filters(self, filters: dict) -> None:
         if self._bundle is None:
@@ -158,7 +192,7 @@ class OverviewTab(QWidget):
                 f"{row.get('inventory_age_days', 0):.0f}",
                 f"{fr * 100:.1f}%",
                 "Yes" if row.get("runout_risk") else "No",
-                str(int(row.get("days_since_last_sale") or 0)) if row.get("days_since_last_sale") is not None else "—",
+                _safe_days(row.get("days_since_last_sale")),
                 str(launch) if pd.notna(launch) else "—",
                 f"{turn:.2f}x",
                 f"{row.get('stockturn_target', 4.0):.1f}x",
@@ -192,3 +226,40 @@ class OverviewTab(QWidget):
         item = self._table.item(row, 0)
         if item:
             self.sku_selected.emit(item.text())
+
+    # ------------------------------------------------------------------
+    # Persisted table settings
+    # ------------------------------------------------------------------
+
+    def _apply_saved_rules(self) -> None:
+        from app.data.store import get_table_rules
+        self._table.set_rules(get_table_rules("overview"))
+
+    def _apply_saved_column_prefs(self) -> None:
+        from app.data.store import get_column_prefs
+        for col, visible in get_column_prefs("overview").items():
+            self._table.set_column_visible(col, visible)
+
+    def _open_column_manager(self) -> None:
+        from app.data.store import set_column_prefs
+        dlg = ColumnManagerDialog(self._table._column_names, self._table, self)
+        if dlg.exec():
+            prefs = dlg.get_prefs()
+            set_column_prefs("overview", prefs)
+            for col, visible in prefs.items():
+                self._table.set_column_visible(col, visible)
+
+    def _open_rules_dialog(self) -> None:
+        from app.data.store import get_table_rules, set_table_rules
+        dlg = ThresholdRulesDialog(
+            self._table._column_names, get_table_rules("overview"), self
+        )
+        if dlg.exec():
+            rules = dlg.get_rules()
+            set_table_rules("overview", rules)
+            self._table.set_rules(rules)
+            # Re-populate so colors take effect immediately
+            if self._bundle is not None:
+                filters = self._sidebar.get_filters()
+                df = self._filter_metrics(self._bundle.sku_metrics, filters)
+                self._refresh_table(df)

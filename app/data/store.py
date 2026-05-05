@@ -210,3 +210,43 @@ def get_all_launch_dates() -> dict[str, date]:
         except ValueError:
             pass
     return result
+
+
+# ---------------------------------------------------------------------------
+# Column visibility preferences
+# Key: table_id (e.g. "overview")  Value: {column_name: bool}
+# ---------------------------------------------------------------------------
+
+_COLUMN_PREFS_FILE = APPDATA_DIR / "column_prefs.json"
+
+
+def get_column_prefs(table_id: str) -> dict[str, bool]:
+    """Return {column_name: is_visible} for the given table."""
+    data = _load(_COLUMN_PREFS_FILE)
+    return {k: bool(v) for k, v in data.get(table_id, {}).items()}
+
+
+def set_column_prefs(table_id: str, prefs: dict[str, bool]) -> None:
+    data = _load(_COLUMN_PREFS_FILE)
+    data[table_id] = {k: bool(v) for k, v in prefs.items()}
+    _save(_COLUMN_PREFS_FILE, data)
+
+
+# ---------------------------------------------------------------------------
+# Table color / threshold rules
+# Key: table_id (e.g. "overview")  Value: list of rule dicts
+# ---------------------------------------------------------------------------
+
+_TABLE_RULES_FILE = APPDATA_DIR / "table_rules.json"
+
+
+def get_table_rules(table_id: str) -> list[dict]:
+    """Return the list of color-threshold rules for the given table."""
+    data = _load(_TABLE_RULES_FILE)
+    return list(data.get(table_id, []))
+
+
+def set_table_rules(table_id: str, rules: list[dict]) -> None:
+    data = _load(_TABLE_RULES_FILE)
+    data[table_id] = rules
+    _save(_TABLE_RULES_FILE, data)

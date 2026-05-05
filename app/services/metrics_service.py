@@ -84,13 +84,15 @@ def compute_all(
 
         days_in_range = max((end_date - start_date).days + 1, 1)
 
+        # Update launch dates FIRST so avg_daily_sales uses the correct per-SKU window
+        _update_launch_dates(orders, rolls)
+        launch_dates = get_all_launch_dates()
+
         # Aggregate per base_sku
         bundle.sku_metrics = _compute_sku_metrics(
-            items, orders, open_pos, rolls, pending, days_in_range, start_date, end_date
+            items, orders, open_pos, rolls, pending, days_in_range, start_date, end_date,
+            launch_dates,
         )
-
-        # Update launch dates
-        _update_launch_dates(orders, rolls)
 
         # Build timeline
         bundle.timeline = _build_timelines(bundle.sku_metrics, open_pos, end_date)
@@ -140,8 +142,21 @@ def _compute_sku_metrics(
     days_in_range: int,
     start_date: date,
     end_date: date,
+    launch_dates: dict,
 ) -> pd.DataFrame:
     today = date.today()
+
+    # Floor date — launch dates older than this are capped so new-item avg_daily
+    # is not diluted by the full query window.
+    _FLOOR = date(2025, 8, 5)
+
+    def _effective_days(sku: str) -> int:
+        """Days the product has been available, floored at Aug 5 2025."""
+        ld = launch_dates.get(str(sku))
+        if ld is None:
+            return days_in_range
+        effective_start = max(ld, _FLOOR)
+        return max((end_date - effective_start).days + 1, 1)
 
     # --- Sales aggregation ---
     if not orders.empty:
@@ -157,7 +172,8 @@ def _compute_sku_metrics(
             )
             .reset_index()
         )
-        sales_agg["avg_daily_sales_sy"] = sales_agg["total_qty_sy"] / days_in_range
+        sales_agg["effective_days"] = sales_agg["base_sku"].apply(_effective_days)
+        sales_agg["avg_daily_sales_sy"] = sales_agg["total_qty_sy"] / sales_agg["effective_days"]
         sales_agg["fill_rate"] = (
             sales_agg["filled_count"] / sales_agg["orders_count"].clip(lower=1)
         ).clip(0, 1)
@@ -275,8 +291,7 @@ def _compute_sku_metrics(
     # SKU rating A/B/C/D by orders_count quartile
     m = _assign_ratings(m)
 
-    # Launch dates
-    launch_dates = get_all_launch_dates()
+    # Launch dates (passed from compute_all — already updated before this call)
     m["launch_date"] = m["base_sku"].map(launch_dates)
 
     # Stock-turn targets (resolved per-SKU attributes)

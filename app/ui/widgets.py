@@ -4,6 +4,7 @@ Reusable widget components shared across tabs.
 
 from __future__ import annotations
 
+import re
 from typing import Callable, Optional
 
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
@@ -16,6 +17,33 @@ from PyQt6.QtWidgets import (
 )
 
 import app.ui.theme as theme
+
+
+# ---------------------------------------------------------------------------
+# Rule matching for DataTable threshold coloring
+# ---------------------------------------------------------------------------
+
+def _rule_matches(cell_val: str, op: str, threshold: str) -> bool:
+    """Return True if cell_val satisfies the threshold rule."""
+    # Strip non-numeric characters for numeric comparison
+    clean = re.sub(r"[^0-9.\-]", "", cell_val)
+    try:
+        num = float(clean)
+        thr = float(threshold)
+        if op == ">":  return num > thr
+        if op == ">=": return num >= thr
+        if op == "<":  return num < thr
+        if op == "<=": return num <= thr
+        if op == "=":  return abs(num - thr) < 1e-9
+        if op == "!=": return abs(num - thr) >= 1e-9
+    except ValueError:
+        pass
+    # String fallback
+    cv, tv = cell_val.strip().lower(), threshold.strip().lower()
+    if op == "=":        return cv == tv
+    if op == "!=":       return cv != tv
+    if op == "contains": return tv in cv
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -78,12 +106,14 @@ class HSep(QFrame):
 
 
 # ---------------------------------------------------------------------------
-# Sortable table with column visibility
+# Sortable table with column visibility and threshold-coloring rules
 # ---------------------------------------------------------------------------
 
 class DataTable(QTableWidget):
     def __init__(self, columns: list[str], parent=None):
         super().__init__(0, len(columns), parent)
+        self._column_names: list[str] = list(columns)
+        self._rules: list[dict] = []
         self.setHorizontalHeaderLabels(columns)
         self.setAlternatingRowColors(True)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -91,16 +121,74 @@ class DataTable(QTableWidget):
         self.setSortingEnabled(True)
         self.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.horizontalHeader().setStretchLastSection(True)
+        self.horizontalHeader().setSectionsMovable(True)  # drag-to-reorder
         self.verticalHeader().setVisible(False)
         self.setShowGrid(True)
+
+    # ------------------------------------------------------------------
+    # Column visibility
+    # ------------------------------------------------------------------
+
+    def set_column_visible(self, col_name: str, visible: bool) -> None:
+        """Show or hide a column by its header label."""
+        try:
+            idx = self._column_names.index(col_name)
+            self.setColumnHidden(idx, not visible)
+        except ValueError:
+            pass
+
+    # ------------------------------------------------------------------
+    # Threshold coloring rules
+    # ------------------------------------------------------------------
+
+    def set_rules(self, rules: list[dict]) -> None:
+        """Set the coloring rules applied on every populate() call."""
+        self._rules = list(rules)
+
+    # ------------------------------------------------------------------
+    # Data population with rule-based coloring
+    # ------------------------------------------------------------------
 
     def populate(self, rows: list[list]) -> None:
         self.setSortingEnabled(False)
         self.setRowCount(len(rows))
         for r, row_data in enumerate(rows):
+            row_bg: str | None = None
+            row_fg: str | None = None
+            cell_overrides: dict[int, tuple[str | None, str | None]] = {}
+
+            for rule in self._rules:
+                col_name = rule.get("column", "")
+                try:
+                    col_idx = self._column_names.index(col_name)
+                except ValueError:
+                    continue
+                if col_idx >= len(row_data):
+                    continue
+                cell_val = str(row_data[col_idx]) if row_data[col_idx] is not None else ""
+                if _rule_matches(cell_val, rule.get("op", ">"), str(rule.get("value", ""))):
+                    bg = rule.get("bg_color") or None
+                    fg = rule.get("fg_color") or None
+                    if rule.get("target") == "row":
+                        row_bg, row_fg = bg, fg
+                    else:
+                        cell_overrides[col_idx] = (bg, fg)
+
             for c, val in enumerate(row_data):
                 item = QTableWidgetItem(str(val) if val is not None else "")
                 item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+
+                # Determine effective colors for this cell
+                if c in cell_overrides:
+                    bg, fg = cell_overrides[c]
+                else:
+                    bg, fg = row_bg, row_fg
+
+                if bg:
+                    item.setBackground(QColor(bg))
+                if fg:
+                    item.setForeground(QColor(fg))
+
                 self.setItem(r, c, item)
         self.setSortingEnabled(True)
         self.resizeRowsToContents()
