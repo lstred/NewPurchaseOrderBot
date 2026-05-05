@@ -1,4 +1,8 @@
-PyQt6==6.7.1
+PyQt6==6.7.0
+PyQt6-Qt6==6.7.3
+PyQt6-WebEngine==6.7.0
+PyQt6-WebEngine-Qt6==6.7.3
+PyQt6-WebEngineSubwheel-Qt6==6.7.3
 pyqtgraph==0.13.7
 plotly==5.22.0
 pandas==2.2.2
