@@ -1,0 +1,8 @@
+PyQt6==6.7.1
+pyqtgraph==0.13.7
+plotly==5.22.0
+pandas==2.2.2
+SQLAlchemy==2.0.30
+pyodbc==5.1.0
+python-dateutil==2.9.0
+PyInstaller==6.8.0

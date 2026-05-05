@@ -1,0 +1,309 @@
+"""
+Inventory Timeline tab — per-SKU 180-day forward projection.
+Shows current inventory, incoming POs, daily consumption, and projected stockouts.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import pandas as pd
+from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtWidgets import (
+    QComboBox, QHBoxLayout, QLabel, QSizePolicy,
+    QSplitter, QVBoxLayout, QWidget, QFrame, QScrollArea,
+)
+
+import plotly.graph_objects as go
+
+from app.services.metrics_service import DatasetBundle
+from app.ui.widgets import (
+    DataTable, FilterSidebar, SectionTitle, HSep, KpiCard,
+    make_chart_widget, update_chart_widget,
+)
+import app.ui.theme as theme
+
+
+class TimelineTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._bundle: Optional[DatasetBundle] = None
+        self._chart_widget = None
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Sidebar
+        self._sidebar = FilterSidebar()
+        self._sidebar.filters_changed.connect(self._on_filter_change)
+        root.addWidget(self._sidebar)
+
+        # Main
+        content = QWidget()
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(20, 16, 20, 16)
+        cl.setSpacing(12)
+
+        # Controls row
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(SectionTitle("Inventory Timeline"))
+        ctrl.addStretch()
+        ctrl.addWidget(QLabel("SKU:"))
+        self._sku_combo = QComboBox()
+        self._sku_combo.setMinimumWidth(240)
+        self._sku_combo.currentTextChanged.connect(self._on_sku_changed)
+        ctrl.addWidget(self._sku_combo)
+        cl.addLayout(ctrl)
+        cl.addWidget(HSep())
+
+        # KPI mini row
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(10)
+        self._kpis = {
+            "inventory_sy": KpiCard("Current Inventory (SY)", "—", "info"),
+            "on_order_sy": KpiCard("On Order (SY)", "—", "accent"),
+            "avg_daily": KpiCard("Avg Daily Sales (SY)", "—", "text"),
+            "days_of_inv": KpiCard("Days of Inventory", "—", "success"),
+            "stockout_day": KpiCard("Projected Stockout", "—", "danger"),
+        }
+        for card in self._kpis.values():
+            card.setMinimumWidth(140)
+            kpi_row.addWidget(card)
+        cl.addLayout(kpi_row)
+
+        # Chart placeholder
+        self._chart_placeholder = QLabel("Select a SKU to view its inventory timeline.")
+        self._chart_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._chart_placeholder.setStyleSheet(f"color: {theme.get('text_muted')}; font-size: 14px;")
+        self._chart_placeholder.setMinimumHeight(360)
+        cl.addWidget(self._chart_placeholder)
+
+        # PO detail table
+        cl.addWidget(HSep())
+        cl.addWidget(QLabel("Scheduled Purchase Orders:"))
+        self._po_table = DataTable(["Order #", "ETA Date", "Qty (SY)", "Supplier"])
+        self._po_table.setMaximumHeight(180)
+        cl.addWidget(self._po_table)
+
+        # Recommendation
+        self._rec_frame = QFrame()
+        self._rec_frame.setObjectName("alert_card_warn")
+        rec_l = QVBoxLayout(self._rec_frame)
+        self._rec_label = QLabel("")
+        self._rec_label.setWordWrap(True)
+        self._rec_label.setStyleSheet(f"color: {theme.get('warning')}; font-size: 13px;")
+        rec_l.addWidget(self._rec_label)
+        cl.addWidget(self._rec_frame)
+        self._rec_frame.setVisible(False)
+
+        cl.addStretch()
+        root.addWidget(content)
+
+    # ------------------------------------------------------------------
+
+    def refresh(self, bundle: DatasetBundle) -> None:
+        self._bundle = bundle
+        if bundle.filter_values is not None and not bundle.filter_values.empty:
+            self._sidebar.populate(bundle.filter_values)
+        self._repopulate_combo(bundle.sku_metrics)
+
+    def select_sku(self, sku: str) -> None:
+        idx = self._sku_combo.findText(sku)
+        if idx >= 0:
+            self._sku_combo.setCurrentIndex(idx)
+
+    # ------------------------------------------------------------------
+
+    def _repopulate_combo(self, df: Optional[pd.DataFrame]) -> None:
+        self._sku_combo.blockSignals(True)
+        current = self._sku_combo.currentText()
+        self._sku_combo.clear()
+        if df is not None and not df.empty:
+            skus = sorted(df["sku"].unique().tolist())
+            self._sku_combo.addItems(skus)
+            idx = self._sku_combo.findText(current)
+            if idx >= 0:
+                self._sku_combo.setCurrentIndex(idx)
+        self._sku_combo.blockSignals(False)
+        self._on_sku_changed(self._sku_combo.currentText())
+
+    def _on_filter_change(self, filters: dict) -> None:
+        if self._bundle is None:
+            return
+        df = self._bundle.sku_metrics
+        self._repopulate_combo(df)
+
+    def _on_sku_changed(self, sku: str) -> None:
+        if not sku or self._bundle is None:
+            return
+        self._render_sku(sku)
+
+    def _render_sku(self, sku: str) -> None:
+        if self._bundle is None:
+            return
+        metrics_df = self._bundle.sku_metrics
+        timeline_df = self._bundle.timeline.get(sku)
+        open_pos = self._bundle.open_pos
+
+        # SKU row
+        row = metrics_df[metrics_df["sku"] == sku]
+        if row.empty:
+            return
+        row = row.iloc[0]
+
+        inv_sy = float(row.get("inventory_sy", 0))
+        on_order = float(row.get("on_order_sy", 0))
+        avg_daily = float(row.get("avg_daily_sales_sy", 0))
+        _inf = float("inf")
+        doi = float(row.get("days_of_inventory", _inf))
+
+        self._kpis["inventory_sy"].set_value(f"{inv_sy:,.1f} SY")
+        self._kpis["on_order_sy"].set_value(f"{on_order:,.1f} SY")
+        self._kpis["avg_daily"].set_value(f"{avg_daily:.2f} SY/day")
+        self._kpis["days_of_inv"].set_value(
+            f"{doi:.0f}d" if doi < _inf else "∞",
+            "success" if doi > 60 else "warning" if doi > 20 else "danger",
+        )
+
+        # Stockout projection
+        stockout_day = None
+        if timeline_df is not None and not timeline_df.empty:
+            so_rows = timeline_df[timeline_df["stockout"]]
+            if not so_rows.empty:
+                stockout_day = so_rows.iloc[0]["date"]
+
+        self._kpis["stockout_day"].set_value(
+            str(stockout_day) if stockout_day else "No stockout",
+            "danger" if stockout_day else "success",
+        )
+
+        # Build chart
+        if timeline_df is not None and not timeline_df.empty:
+            fig = self._build_fig(sku, timeline_df, open_pos)
+            if self._chart_widget is None:
+                self._chart_widget = make_chart_widget(fig)
+                # Replace placeholder
+                layout = self.layout()
+                content_widget = layout.itemAt(1).widget()
+                cl = content_widget.layout()
+                # Find and replace placeholder
+                for i in range(cl.count()):
+                    item = cl.itemAt(i)
+                    if item and item.widget() is self._chart_placeholder:
+                        cl.removeWidget(self._chart_placeholder)
+                        self._chart_placeholder.hide()
+                        cl.insertWidget(i, self._chart_widget)
+                        break
+            else:
+                update_chart_widget(self._chart_widget, fig)
+
+        # PO detail table
+        sku_pos = open_pos[open_pos["base_sku"] == sku] if not open_pos.empty else pd.DataFrame()
+        po_rows = []
+        for _, pr in sku_pos.iterrows():
+            po_rows.append([
+                str(pr.get("order_number", "")),
+                str(pr.get("eta_date", "")),
+                f"{pr.get('quantity_sy', 0):.1f}",
+                str(pr.get("supplier_number", "")),
+            ])
+        self._po_table.populate(po_rows)
+
+        # Recommendation
+        rec = self._build_recommendation(row, stockout_day, open_pos, sku)
+        if rec:
+            self._rec_label.setText(rec)
+            self._rec_frame.setVisible(True)
+        else:
+            self._rec_frame.setVisible(False)
+
+    def _build_fig(self, sku: str, df: pd.DataFrame, open_pos: pd.DataFrame):
+        c = theme.DARK if theme.is_dark() else theme.LIGHT
+        dates = df["date"].tolist()
+
+        fig = go.Figure()
+
+        # Inventory area
+        fig.add_trace(go.Scatter(
+            x=dates, y=df["inventory_sy"].tolist(),
+            mode="lines", name="Projected Inventory",
+            line=dict(color=c["accent"], width=2),
+            fill="tozeroy",
+            fillcolor=f"rgba(78,140,255,0.15)",
+        ))
+
+        # PO incoming bars
+        if "incoming_sy" in df.columns:
+            inc = df[df["incoming_sy"] > 0]
+            if not inc.empty:
+                fig.add_trace(go.Bar(
+                    x=inc["date"].tolist(), y=inc["incoming_sy"].tolist(),
+                    name="PO Receipt", marker_color=c["success"],
+                    opacity=0.8,
+                ))
+
+        # Stockout zone
+        so = df[df["stockout"]]
+        if not so.empty:
+            fig.add_vrect(
+                x0=so.iloc[0]["date"], x1=df.iloc[-1]["date"],
+                fillcolor=f"rgba(224,82,96,0.10)",
+                layer="below", line_width=0,
+                annotation_text="Stockout Zone",
+                annotation_position="top left",
+                annotation_font_color=c["danger"],
+            )
+
+        fig.update_layout(
+            paper_bgcolor=c["chart_bg"],
+            plot_bgcolor=c["chart_bg"],
+            font=dict(color=c["text"], family="Segoe UI"),
+            title=dict(text=f"Inventory Projection — {sku}", font=dict(size=14)),
+            xaxis=dict(gridcolor=c["border"], title="Date"),
+            yaxis=dict(gridcolor=c["border"], title="Quantity (SY)"),
+            legend=dict(bgcolor="rgba(0,0,0,0)"),
+            margin=dict(l=60, r=20, t=50, b=50),
+            hovermode="x unified",
+        )
+        return fig
+
+    def _build_recommendation(self, row, stockout_day, open_pos, sku: str) -> str:
+        avg_daily = float(row.get("avg_daily_sales_sy", 0))
+        inv_sy = float(row.get("inventory_sy", 0))
+        on_order = float(row.get("on_order_sy", 0))
+        lead_time = int(row.get("lead_time_days", 30))
+        target = float(row.get("stockturn_target", 4.0))
+
+        if avg_daily == 0:
+            return ""
+
+        target_doi = 365.0 / target
+        target_qty = avg_daily * target_doi
+        needed = max(target_qty - inv_sy - on_order, 0)
+
+        if stockout_day and on_order == 0:
+            from datetime import date
+            days_until = (stockout_day - date.today()).days
+            return (
+                f"⚠ Projected stockout in {days_until} day(s) with no open POs. "
+                f"Reorder immediately — lead time is ~{lead_time} day(s). "
+                f"Recommended order quantity: {needed:.0f} SY to reach {target:.1f}x turn target."
+            )
+        if row.get("overstock_flag"):
+            _inf = float("inf")
+            doi = float(row.get("days_of_inventory", _inf))
+            return (
+                f"⚠ Overstock detected: {doi:.0f} days of inventory vs. target "
+                f"{target_doi:.0f} days ({target:.1f}x turn). Consider pausing or reducing future orders."
+            )
+        if row.get("excess_order_flag"):
+            return (
+                f"⚠ Excess orders on the books: total supply ({inv_sy + on_order:.0f} SY) "
+                f"exceeds {target:.1f}x turn target for this period."
+            )
+        return ""

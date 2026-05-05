@@ -1,0 +1,4 @@
+config_local.py
+*.pyc
+__pycache__/
+.env
