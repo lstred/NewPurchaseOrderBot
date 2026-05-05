@@ -492,7 +492,7 @@ cache_ttl_seconds:      360       # 6 minutes — how long SQLAlchemy query resu
 
 ---
 
-## 11. File Structure Reference
+## 11. File Structure Reference (Planned)
 
 ```
 app/
@@ -514,3 +514,178 @@ app/
     dashboard.py         — Streamlit UI (all tabs)
 config_local.py          — Local connection string override (not committed)
 ```
+
+---
+
+## 12. Built Application — Implementation Reference
+
+> **Status:** Fully built and deployed to GitHub (`lstred/NewPurchaseOrderBot`).  
+> **Last updated:** 2026-05-05  
+> **Python:** 3.11 · **Venv:** `.venv/` in project root  
+> **Run:** `.\.venv\Scripts\python.exe main.py`
+
+---
+
+### 12.1 Actual File Structure
+
+```
+NewPurchBot/
+  main.py                    — Entry point: QApplication, MainWindow, exception hook
+  validate_db.py             — Standalone DB validation script (run anytime)
+  app.spec                   — PyInstaller spec (onefile exe, no console)
+  requirements.txt           — PyQt6, plotly, pandas, SQLAlchemy, pyodbc, PyInstaller
+  config_local.py            — Local ODBC override (gitignored)
+  .gitignore
+  CLAUDE.md                  — This file
+
+  app/
+    config.py                — AppConfig dataclass + connection string resolution
+    __init__.py
+
+    data/
+      db.py                  — Engine singleton, read_dataframe(), validate_connection()
+      queries.py             — All SQL strings: ITEMS_SQL, ORDERS_SQL, ROLLS_SQL, etc.
+      loaders.py             — load_items/orders/rolls/open_pos/pending_pos/filter_values()
+      store.py               — JSON persistence: targets, snooze state, launch dates
+      __init__.py
+
+    services/
+      metrics_service.py     — compute_all() → DatasetBundle; all per-SKU KPI logic
+      __init__.py
+
+    ui/
+      theme.py               — DARK/LIGHT palettes, full QSS, toggle()
+      widgets.py             — KpiCard, DataTable, FilterSidebar, HSep, chart helpers
+      main_window.py         — MainWindow: toolbar, tabs, QThread background loader
+      tab_overview.py        — Overview tab: 6 KPI cards + 21-column SKU table
+      tab_timeline.py        — Inventory Timeline: 180-day Plotly projection per SKU
+      tab_fillrate.py        — Fill Rate: histogram + per-SKU table
+      tab_problems.py        — Problem Areas: alert cards with snooze
+      tab_settings.py        — Settings: stock-turn targets at all filter levels
+      __init__.py
+```
+
+---
+
+### 12.2 Technology Stack
+
+| Component | Package | Version |
+|---|---|---|
+| UI framework | PyQt6 | 6.7.1 |
+| Charts | plotly + PyQt6-WebEngine | 5.22+ |
+| Data | pandas | 2.2.2 |
+| DB driver | SQLAlchemy + pyodbc | 2.0.x + 5.1.0 |
+| Packaging | PyInstaller | 6.8.0 |
+
+---
+
+### 12.3 Running the App
+
+```powershell
+# From project root
+.\.venv\Scripts\python.exe main.py
+
+# Validate DB (safe read-only checks)
+.\.venv\Scripts\python.exe validate_db.py
+
+# Build exe
+.\.venv\Scripts\python.exe -m PyInstaller app.spec
+# Output: dist\InventoryControl.exe
+```
+
+---
+
+### 12.4 Critical SQL Column Name Quirks
+
+These quirks caused bugs and must be remembered for any future queries.
+
+| Table | Column | How to reference in SQL | Notes |
+|---|---|---|---|
+| `PRICE` | `$PRCCD` | `p.[$PRCCD]` | Dollar-sign prefix — bracket AND include `$` |
+| `PRICE` | `$LIST#` | `p.[$LIST#]` | Dollar-sign prefix — bracket AND include `$` |
+| `PRICE` | `$DESC` | `p.[$DESC]` | Dollar-sign prefix — bracket AND include `$` |
+| `_ORDERS` | `ORDER#` | `o.[ORDER#]` | Hash in name — must bracket |
+| `_ORDERS` | `LINE#I` | `o.[LINE#I]` | Hash in name — must bracket |
+| `_ORDERS` | `ACCOUNT#I` | `o.[ACCOUNT#I]` | Hash in name — must bracket |
+| `_ORDERS` | `INVOICE#` | `o.[INVOICE#]` | Hash in name — must bracket |
+| `_ORDERS` | `SUPPLIER#` | `o.[SUPPLIER#]` | Hash in name — must bracket |
+| `ITEM` | `ISUPP#` | `i.[ISUPP#]` | Hash in name — must bracket |
+| `ROLLS` | `RCODE@` | `r.[RCODE@]` | At-sign in name — must bracket |
+| `ROLLS` | `RROLL#` | `r.[RROLL#]` | Hash in name — must bracket |
+| `OPENPO_D` | `D@MFGR` | `d.[D@MFGR]` | At-sign prefix — must bracket |
+| `OPENPO_D` | `D@COLO` | `d.[D@COLO]` | At-sign prefix — must bracket |
+| `OPENPO_D` | `D@PATT` | `d.[D@PATT]` | At-sign prefix — must bracket |
+| `OPENPO_D` | `D@QTYO` | `d.[D@QTYO]` | At-sign prefix — must bracket |
+| `OPENPO_D` | `D@QTYP` | `d.[D@QTYP]` | At-sign prefix — must bracket |
+| `OPENPO_D` | `D@ACCT` | `d.[D@ACCT]` | At-sign prefix — must bracket |
+| `OPENPO_D` | `D@DEL8` | `d.[D@DEL8]` | At-sign prefix — must bracket |
+| `OPENPO_D` | `D@SUPP` | `d.[D@SUPP]` | At-sign prefix — must bracket |
+| `OPENPO_D` | `D@REF#` | `d.[D@REF#]` | At-sign prefix + hash — must bracket |
+| `PRODLINE` | `LPROD#` | `pl.[LPROD#]` | Hash in name — must bracket |
+| `PRODLINE` | `LMFGR#` | `pl.[LMFGR#]` | Hash in name — must bracket |
+
+> **Rule:** Any column containing `#`, `@`, or `$` must be wrapped in `[square brackets]` in T-SQL,
+> and the special character must be included inside the brackets exactly as it appears in the DB.
+
+---
+
+### 12.5 AppData Persistence Files
+
+All JSON files stored at `%APPDATA%\PurchaseOrderBot\`:
+
+| File | Purpose | Key format |
+|---|---|---|
+| `config.json` | Optional connection string override | `{"SQLSERVER_ODBC": "..."}` |
+| `stockturn_targets.json` | Per-level stock-turn targets | `"global"`, `"cc:010"`, `"pc:PRMPLF"`, `"pl:ROC"`, `"sup:MAR"`, `"sku:ABCDEF"` |
+| `snooze.json` | Snoozed problem alerts | `"{type}:{sku}": {"until": "YYYY-MM-DD", "po_qty_at_snooze": 0.0}` |
+| `launch_dates.json` | Auto-detected earliest sale/receipt date per SKU | `"{sku}": "YYYY-MM-DD"` |
+
+---
+
+### 12.6 Key Design Decisions
+
+| Decision | Detail |
+|---|---|
+| **UI framework** | PyQt6 — native desktop, no browser required, suitable for PyInstaller exe |
+| **Charts** | Plotly rendered in `QWebEngineView`; falls back to placeholder label if WebEngine not installed |
+| **Background loading** | `QThread` + `QObject` worker pattern — SQL queries run off the main thread so UI stays responsive |
+| **SKU alias resolution** | Done in Python (loaders.py), not SQL — `ITEM.IIXREF` maps alias → base SKU before any groupby |
+| **Snooze auto-unsnooze** | PO quantity check always runs first in `is_snoozed()`; if on-order qty changed, snooze is cleared |
+| **Stock-turn conflict resolution** | Most specific key wins: `sku:` > `cc:` > `pc:` > `pl:` > `sup:` > `global` |
+| **Fill rate definition** | `filled_count / orders_count` where `filled_count` = lines where status is NOT `'B'` or `'R'` |
+| **Backorder qty** | Only `'B'` status (not `'R'`) counted toward `strict_bo_qty_sy` |
+| **Cost center exclusion** | Any CC starting with `'1'` is always excluded — applied in `_apply_item_filters()` |
+| **Future-dated orders excluded** | `order_entry_date > today` filtered out in `load_orders()` |
+
+---
+
+### 12.7 Bugs Fixed (for future AI context)
+
+| Bug | File | Root Cause | Fix Applied |
+|---|---|---|---|
+| `Invalid column name 'PRCCD'` | `queries.py` | PRICE table columns have `$` prefix; referenced without it | Changed `[PRCCD]` → `[$PRCCD]`, `[LIST#]` → `[$LIST#]`, `[DESC]` → `[$DESC]` in both ITEMS_SQL and FILTER_VALUES_SQL |
+| Snooze "until PO qty changes" never stuck | `store.py` | `is_snoozed()` fell through to `return False` after PO qty check | Reordered: check PO qty change first (unsnooze if changed), then check date, then return `True` for indefinite snooze |
+| Timeline reorder markers on wrong day | `metrics_service.py` | `records.index(rec)` finds first match, breaks on duplicate dict values | Replaced with `enumerate(records)` |
+| `QDate` imported inline via `__import__` | `main_window.py` | Leftover hack from development | Moved to proper top-level `from PyQt6.QtCore import QDate` |
+| `df.get("sku_description", pd.Series(...))` length mismatch | `tab_overview.py` | `pd.Series` fallback has length 1, not len(df) | Guarded with `if "sku_description" in df.columns` |
+
+---
+
+### 12.8 Validation Results (2026-05-05)
+
+All 11 tables confirmed live with data:
+
+| Table | Rows returned | Notes |
+|---|---|---|
+| `_ORDERS` (sales) | 5 | Account#I > 1, N_NOT_INVENTORY='Y' |
+| `_ORDERS` (POs) | 5 | Account#I = 1 |
+| `ITEM` | 5 | IINVEN='Y' — 17,275 total active items |
+| `ROLLS` | 5 | Available > 0, no REM/inactive |
+| `OPENPO_D` | 5 | Account=1, not deleted, not 001 supplier |
+| `PRODLINE` | 5 | All rows |
+| `PRICE` | 5 | $LIST#='LP' |
+| `CLASSES` | 5 | CLCAT='CC' |
+| `ITEMSTK` | 5 | All rows |
+| `_INVENTORY` | 5 | TotalCost > 0 |
+| `OPENIV` | 5 | NREFTY='R' |
+
