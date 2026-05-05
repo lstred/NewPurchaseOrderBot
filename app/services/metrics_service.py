@@ -45,6 +45,7 @@ class DatasetBundle:
     timeline: dict[str, pd.DataFrame] = field(default_factory=dict)
     filter_values: pd.DataFrame = field(default_factory=pd.DataFrame)
     summary: dict = field(default_factory=dict)
+    refresh_info: dict = field(default_factory=dict)  # {refreshed: [...], cached: [...], ts_ok: bool}
     error: Optional[str] = None
 
 
@@ -60,27 +61,72 @@ def compute_all(
     bundle = DatasetBundle()
 
     try:
-        bundle.filter_values = load_filter_values()
-        bundle.items = load_items()
+        from app.data import cache as _cache
+
+        # ── Smart refresh: consult sysTableUpdates ────────────────────────────
+        current_ts  = _cache.fetch_timestamps()
+        all_datasets = set(_cache.DATASET_TABLES.keys())
+        stale = _cache.compute_stale(current_ts, str(start_date), str(end_date))
+        will_cache = all_datasets - stale
+
+        def _use_or_load(key: str, loader_fn):
+            """Return cached DF if not stale, else call loader_fn and cache result."""
+            if key not in stale:
+                cached = _cache.get_df(key)
+                if cached is not None:
+                    return cached
+            df = loader_fn()
+            _cache.set_df(key, df)
+            return df
+
+        # ── filter_values ─────────────────────────────────────────────────────
+        bundle.filter_values = _use_or_load("filter_values", load_filter_values)
+
+        # ── items (full, unfiltered — needed for complete alias resolution) ───
+        bundle.items = _use_or_load("items", load_items)
 
         if bundle.items.empty:
             bundle.error = "No item data returned. Check database connection."
             return bundle
 
-        # Apply filters to item master
+        # Apply user filters to item master (for scoping metrics)
         items = _apply_item_filters(bundle.items, filters)
-
-        bundle.orders = load_orders(start_date, end_date, items_df=items)
-        bundle.open_pos = load_open_pos(items_df=items)
-        bundle.rolls = load_rolls(items_df=items)
-        bundle.pending_pos = load_pending_pos(items_df=items)
-
-        # Filter order/roll data to SKUs in filtered item set
         active_skus = set(items["base_sku"].unique())
-        orders = bundle.orders[bundle.orders["base_sku"].isin(active_skus)]
-        open_pos = bundle.open_pos[bundle.open_pos["base_sku"].isin(active_skus)]
-        rolls = bundle.rolls[bundle.rolls["base_sku"].isin(active_skus)]
-        pending = bundle.pending_pos[bundle.pending_pos["base_sku"].isin(active_skus)]
+
+        # ── orders (use FULL items for alias resolution, not filtered) ────────
+        bundle.orders = _use_or_load(
+            "orders",
+            lambda: load_orders(start_date, end_date, items_df=bundle.items),
+        )
+
+        # ── open purchase orders ──────────────────────────────────────────────
+        bundle.open_pos = _use_or_load(
+            "open_pos",
+            lambda: load_open_pos(items_df=bundle.items),
+        )
+
+        # ── physical rolls ────────────────────────────────────────────────────
+        bundle.rolls = _use_or_load(
+            "rolls",
+            lambda: load_rolls(items_df=bundle.items),
+        )
+
+        # ── pending POs (OPENPO_D) ────────────────────────────────────────────
+        bundle.pending_pos = _use_or_load(
+            "pending_pos",
+            lambda: load_pending_pos(items_df=bundle.items),
+        )
+
+        # ── Filter all datasets to the active-SKU scope ───────────────────────
+        def _filt(df: pd.DataFrame) -> pd.DataFrame:
+            if df.empty or "base_sku" not in df.columns:
+                return df
+            return df[df["base_sku"].isin(active_skus)]
+
+        orders   = _filt(bundle.orders)
+        open_pos = _filt(bundle.open_pos)
+        rolls    = _filt(bundle.rolls)
+        pending  = _filt(bundle.pending_pos)
 
         days_in_range = max((end_date - start_date).days + 1, 1)
 
@@ -99,6 +145,15 @@ def compute_all(
 
         # Portfolio-level summary
         bundle.summary = _compute_summary(bundle.sku_metrics)
+
+        # Persist timestamps only after a fully successful load
+        _cache.commit(current_ts, str(start_date), str(end_date))
+
+        bundle.refresh_info = {
+            "refreshed": sorted(stale),
+            "cached":    sorted(will_cache),
+            "ts_ok":     bool(current_ts),
+        }
 
     except Exception as exc:
         bundle.error = str(exc)

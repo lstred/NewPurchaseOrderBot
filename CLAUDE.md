@@ -236,7 +236,30 @@ Each row is a physical roll in the warehouse.
 
 ---
 
-### `dbo.CLASSES` — Code Lookup Table
+### `dbo.sysTableUpdates` — Table Modification Timestamps
+
+Used for smart refresh: the app queries this before each data load to skip tables that have not changed since the last refresh.
+
+| DB Column | Alias | Description |
+|---|---|
+| `TABLE_NAME` | — | Name of the table in NRF_REPORTS; `'DW0001F'` maps to `_ORDERS` |
+| `LAST_UPDATE` | — | `DATETIME` of the most recent modification to that table |
+
+**Special mapping:** `TABLE_NAME = 'DW0001F'` represents the `_ORDERS` table.
+All other tables watched by the app (`ITEM`, `PRICE`, `PRODLINE`, `ROLLS`, `OPENPO_D`) match exactly.
+
+**Query used:**
+```sql
+SELECT
+    LTRIM(RTRIM(TABLE_NAME))         AS table_name,
+    CAST(LAST_UPDATE AS VARCHAR(30)) AS last_update
+FROM dbo.sysTableUpdates
+WHERE LTRIM(RTRIM(TABLE_NAME)) IN (
+    'DW0001F', 'ITEM', 'ROLLS', 'OPENPO_D', 'PRODLINE', 'PRICE'
+)
+```
+
+---
 
 | DB Column | Alias | Description |
 |---|---|---|
@@ -547,6 +570,7 @@ NewPurchBot/
       queries.py             — All SQL strings: ITEMS_SQL, ORDERS_SQL, ROLLS_SQL, etc.
       loaders.py             — load_items/orders/rolls/open_pos/pending_pos/filter_values()
       store.py               — JSON persistence: targets, snooze state, launch dates
+      cache.py               — Smart refresh: sysTableUpdates check, in-memory DF store
       __init__.py
 
     services/
@@ -641,6 +665,7 @@ All JSON files stored at `%APPDATA%\PurchaseOrderBot\`:
 | `stockturn_targets.json` | Per-level stock-turn targets | `"global"`, `"cc:010"`, `"pc:PRMPLF"`, `"pl:ROC"`, `"sup:MAR"`, `"sku:ABCDEF"` |
 | `snooze.json` | Snoozed problem alerts | `"{type}:{sku}": {"until": "YYYY-MM-DD", "po_qty_at_snooze": 0.0}` |
 | `launch_dates.json` | Auto-detected earliest sale/receipt date per SKU | `"{sku}": "YYYY-MM-DD"` |
+| `refresh_state.json` | Smart refresh: last-seen sysTableUpdates timestamps + date range | `{"timestamps": {"DW0001F": "...", "ITEM": "..."}, "date_range": "start:end"}` |
 
 ---
 
@@ -658,6 +683,8 @@ All JSON files stored at `%APPDATA%\PurchaseOrderBot\`:
 | **Backorder qty** | Only `'B'` status (not `'R'`) counted toward `strict_bo_qty_sy` |
 | **Cost center exclusion** | Any CC starting with `'1'` is always excluded — applied in `_apply_item_filters()` |
 | **Future-dated orders excluded** | `order_entry_date > today` filtered out in `load_orders()` |
+| **Smart refresh** | Before each load, `app.data.cache` queries `sysTableUpdates`; only stale datasets are reloaded from SQL. If ITEM/PRICE/PRODLINE change, all datasets are invalidated (alias map cascade). If sysTableUpdates is unreachable, all datasets reload as a safe fallback. Timestamps + last date range persisted in `refresh_state.json`. Status bar shows `↻ refreshed: ...  ▪  ⚡ cached: ...` after each load. |
+| **Alias resolution uses full items** | `load_orders/open_pos/rolls/pending_pos` are called with the full (unfiltered) items DF so alias maps are complete regardless of active cost-center filter |
 
 ---
 
@@ -672,6 +699,7 @@ All JSON files stored at `%APPDATA%\PurchaseOrderBot\`:
 | IDISCD filter changed from `IN ('','0')` to `LEN < 2` | `queries.py` | Any 1-character IDISCD value (not just `'0'`) should be treated as not discontinued | Changed both ITEMS_SQL and FILTER_VALUES_SQL to `LEN(LTRIM(RTRIM(CAST(i.IDISCD AS VARCHAR)))) < 2` |
 | `sku_selected` double-click now shows timeline popup | `tab_overview.py` | User wanted click-to-popup timeline without leaving the overview | Changed `_on_row_double_clicked` to open `TimelineDialog`; popup has "Open in Timeline Tab" button to still navigate |
 | Timeline popup added to Problem Areas | `tab_problems.py` | User wanted timeline accessible from alert cards | Added `timeline_requested` signal to `AlertCard`, "📈 Timeline" button, wired to `TimelineDialog` in `ProblemAreasTab` |
+| Smart refresh via sysTableUpdates | `cache.py`, `metrics_service.py`, `main_window.py` | Avoid re-querying unchanged tables on every refresh | `cache.py` fetches timestamps from `sysTableUpdates`, compares to saved state, returns stale dataset set; `compute_all()` only reloads stale ones; status bar shows `↻ refreshed / ⚡ cached` breakdown |
 
 ---
 

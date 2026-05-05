@@ -170,6 +170,7 @@ class MainWindow(QMainWindow):
     def _check_connection(self) -> None:
         self._conn_label.setText("● Checking connection…")
         self._conn_label.setStyleSheet(f"color: {theme.get('warning')};")
+        self._set_status("Connecting to SQL Server…")
 
         def check():
             ok = validate_connection()
@@ -225,12 +226,35 @@ class MainWindow(QMainWindow):
         self._settings_tab.refresh(bundle.filter_values)
 
         sm = bundle.summary
+        ri = bundle.refresh_info
+
+        refreshed = ri.get("refreshed", [])
+        cached    = ri.get("cached", [])
+        ts_ok     = ri.get("ts_ok", False)
+
+        if not ri:
+            cache_note = ""
+        elif not ts_ok:
+            cache_note = "full reload (sysTableUpdates unavailable)"
+        elif not refreshed:
+            cache_note = "⚡ all tables current — served from cache"
+        else:
+            def _fmt(names):
+                return ", ".join(n.replace("_", " ") for n in names)
+            parts = []
+            if refreshed:
+                parts.append(f"↻ refreshed: {_fmt(refreshed)}")
+            if cached:
+                parts.append(f"⚡ cached: {_fmt(cached)}")
+            cache_note = "  ▪  ".join(parts)
+
         self._set_status(
-            f"Loaded {sm.get('total_skus', 0):,} SKUs  |  "
-            f"Stock Turn: {sm.get('stock_turn', 0):.2f}x  |  "
-            f"Fill Rate: {sm.get('fill_rate', 0) * 100:.1f}%  |  "
-            f"{sm.get('overstock_count', 0)} overstock  |  "
+            f"{sm.get('total_skus', 0):,} SKUs  │  "
+            f"Turn: {sm.get('stock_turn', 0):.2f}×  │  "
+            f"Fill: {sm.get('fill_rate', 0)*100:.1f}%  │  "
+            f"{sm.get('overstock_count', 0)} overstock  │  "
             f"{sm.get('runout_sku_count', 0)} runout risk"
+            + (f"     —  {cache_note}" if cache_note else "")
         )
 
     def _on_data_error(self, msg: str) -> None:
