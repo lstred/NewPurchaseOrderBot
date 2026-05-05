@@ -150,6 +150,7 @@ class DataTable(QTableWidget):
     # ------------------------------------------------------------------
 
     def populate(self, rows: list[list]) -> None:
+        self.setUpdatesEnabled(False)
         self.setSortingEnabled(False)
         self.setRowCount(len(rows))
         for r, row_data in enumerate(rows):
@@ -191,7 +192,7 @@ class DataTable(QTableWidget):
 
                 self.setItem(r, c, item)
         self.setSortingEnabled(True)
-        self.resizeRowsToContents()
+        self.setUpdatesEnabled(True)
 
 
 # ---------------------------------------------------------------------------

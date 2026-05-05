@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
 
 import plotly.graph_objects as go
 
-from app.services.metrics_service import DatasetBundle
+from app.services.metrics_service import DatasetBundle, get_sku_timeline
 from app.ui.widgets import DataTable, HSep, KpiCard, make_chart_widget, update_chart_widget
 import app.ui.theme as theme
 
@@ -147,8 +147,6 @@ class TimelineDialog(QDialog):
         sku = self._sku
         bundle = self._bundle
         metrics_df = bundle.sku_metrics
-        timeline_df = bundle.timeline.get(sku)
-        open_pos = bundle.open_pos
 
         row = metrics_df[metrics_df["sku"] == sku]
         if row.empty:
@@ -175,6 +173,9 @@ class TimelineDialog(QDialog):
             "success" if doi > 60 else "warning" if doi > 20 else "danger",
         )
 
+        # Get/build timeline lazily
+        timeline_df = get_sku_timeline(sku, bundle)
+
         # Stockout
         stockout_day = None
         if timeline_df is not None and not timeline_df.empty:
@@ -188,8 +189,9 @@ class TimelineDialog(QDialog):
         )
 
         # Chart
+        po_events = bundle.po_events.get(sku, [])
         if timeline_df is not None and not timeline_df.empty:
-            fig = _build_fig(sku, timeline_df)
+            fig = _build_fig(sku, timeline_df, po_events)
             self._chart_widget = make_chart_widget(fig)
             layout = self.layout()
             for i in range(layout.count()):
@@ -200,19 +202,17 @@ class TimelineDialog(QDialog):
                     layout.insertWidget(i, self._chart_widget)
                     break
 
-        # PO table
-        sku_pos = (
-            open_pos[open_pos["base_sku"] == sku]
-            if not open_pos.empty else pd.DataFrame()
-        )
+        # PO table — use po_events dict (always correct, no base_sku lookup needed)
         po_rows = []
-        for _, pr in sku_pos.iterrows():
+        for ev in po_events:
             po_rows.append([
-                str(pr.get("order_number", "")),
-                str(pr.get("eta_date", "")),
-                f"{float(pr.get('quantity_sy', 0)):,.1f}",
-                str(pr.get("supplier_number", "")),
+                ev.get("order_number", ""),
+                str(ev.get("eta_date", "")),
+                f"{ev.get('quantity_sy', 0):,.1f}",
+                ev.get("supplier_number", ""),
             ])
+        # Sort by ETA date
+        po_rows.sort(key=lambda r: r[1])
         self._po_table.populate(po_rows)
 
         # Recommendation
@@ -228,43 +228,90 @@ class TimelineDialog(QDialog):
 # Module-level helpers (shared with TimelineTab)
 # ---------------------------------------------------------------------------
 
-def _build_fig(sku: str, df: pd.DataFrame):
+def _build_fig(sku: str, df: pd.DataFrame, po_events: list):
     c = theme.DARK if theme.is_dark() else theme.LIGHT
     dates = df["date"].tolist()
 
     fig = go.Figure()
 
-    # Inventory area
-    fig.add_trace(go.Scatter(
-        x=dates, y=df["inventory_sy"].tolist(),
-        mode="lines", name="Projected Inventory",
-        line=dict(color=c["accent"], width=2),
-        fill="tozeroy",
-        fillcolor="rgba(78,140,255,0.15)",
-    ))
-
-    # PO incoming bars
-    if "incoming_sy" in df.columns:
-        inc = df[df["incoming_sy"] > 0]
-        if not inc.empty:
-            fig.add_trace(go.Bar(
-                x=inc["date"].tolist(), y=inc["incoming_sy"].tolist(),
-                name="PO Receipt",
-                marker_color=c["success"],
-                opacity=0.8,
-            ))
-
-    # Stockout zone
+    # ── Stockout zone (below inventory line) ──────────────────────────────
     so = df[df["stockout"]]
     if not so.empty:
         fig.add_vrect(
             x0=so.iloc[0]["date"], x1=df.iloc[-1]["date"],
-            fillcolor="rgba(224,82,96,0.10)",
+            fillcolor="rgba(224,82,96,0.12)",
             layer="below", line_width=0,
             annotation_text="Stockout Zone",
             annotation_position="top left",
             annotation_font_color=c["danger"],
         )
+
+    # ── Inventory projection area ─────────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=dates, y=df["inventory_sy"].tolist(),
+        mode="lines", name="Projected Inventory",
+        line=dict(color=c["accent"], width=2.5),
+        fill="tozeroy",
+        fillcolor="rgba(78,140,255,0.12)",
+        hovertemplate="<b>%{x|%b %d}</b><br>Inventory: %{y:,.1f} SY<extra></extra>",
+    ))
+
+    # ── PO receipt markers — vertical dotted lines + annotation labels ────
+    # Group po_events by date so multiple POs on same day are combined
+    receipt_totals: dict = {}
+    receipt_orders: dict = {}
+    for ev in po_events:
+        d = ev.get("eta_date")
+        if d and pd.notna(d):
+            receipt_totals[d] = receipt_totals.get(d, 0.0) + ev.get("quantity_sy", 0)
+            receipt_orders.setdefault(d, []).append(ev.get("order_number", ""))
+
+    if receipt_totals:
+        # Find y-axis max for annotation positioning
+        y_max = max(df["inventory_sy"].max(), max(receipt_totals.values())) * 1.05
+
+        receipt_dates = list(receipt_totals.keys())
+        receipt_qtys  = [receipt_totals[d] for d in receipt_dates]
+
+        # Scatter markers on the inventory curve at receipt dates
+        # Get the inventory level at each receipt date
+        df_idx = df.set_index("date")
+        receipt_y_on_curve = []
+        for d in receipt_dates:
+            if d in df_idx.index:
+                receipt_y_on_curve.append(df_idx.loc[d, "inventory_sy"])
+            else:
+                receipt_y_on_curve.append(0)
+
+        fig.add_trace(go.Scatter(
+            x=receipt_dates,
+            y=receipt_y_on_curve,
+            mode="markers",
+            name="PO Receipt",
+            marker=dict(
+                symbol="triangle-up",
+                size=14,
+                color=c["success"],
+                line=dict(color=c["success"], width=2),
+            ),
+            customdata=[[receipt_totals[d], ", ".join(receipt_orders[d])] for d in receipt_dates],
+            hovertemplate=(
+                "<b>PO Receipt — %{x|%b %d, %Y}</b><br>"
+                "Incoming: <b>%{customdata[0]:,.1f} SY</b><br>"
+                "Order(s): %{customdata[1]}<extra></extra>"
+            ),
+        ))
+
+        # Add a vertical dashed line for each receipt date
+        for d, qty in receipt_totals.items():
+            fig.add_vline(
+                x=str(d),
+                line=dict(color=c["success"], width=1.5, dash="dot"),
+                annotation_text=f"+{qty:,.0f} SY",
+                annotation_position="top",
+                annotation_font=dict(color=c["success"], size=11),
+                annotation_bgcolor="rgba(0,0,0,0)",
+            )
 
     fig.update_layout(
         paper_bgcolor=c["chart_bg"],

@@ -146,9 +146,8 @@ class TimelineTab(QWidget):
     def _render_sku(self, sku: str) -> None:
         if self._bundle is None:
             return
+        from app.services.metrics_service import get_sku_timeline
         metrics_df = self._bundle.sku_metrics
-        timeline_df = self._bundle.timeline.get(sku)
-        open_pos = self._bundle.open_pos
 
         # SKU row
         row = metrics_df[metrics_df["sku"] == sku]
@@ -170,6 +169,9 @@ class TimelineTab(QWidget):
             "success" if doi > 60 else "warning" if doi > 20 else "danger",
         )
 
+        # Build timeline lazily
+        timeline_df = get_sku_timeline(sku, self._bundle)
+
         # Stockout projection
         stockout_day = None
         if timeline_df is not None and not timeline_df.empty:
@@ -182,9 +184,12 @@ class TimelineTab(QWidget):
             "danger" if stockout_day else "success",
         )
 
+        # PO events for this SKU (pre-built, always correct)
+        po_events = self._bundle.po_events.get(sku, [])
+
         # Build chart
         if timeline_df is not None and not timeline_df.empty:
-            fig = self._build_fig(sku, timeline_df, open_pos)
+            fig = self._build_fig(sku, timeline_df, po_events)
             if self._chart_widget is None:
                 self._chart_widget = make_chart_widget(fig)
                 # Replace placeholder
@@ -203,61 +208,102 @@ class TimelineTab(QWidget):
                 update_chart_widget(self._chart_widget, fig)
 
         # PO detail table
-        sku_pos = open_pos[open_pos["base_sku"] == sku] if not open_pos.empty else pd.DataFrame()
         po_rows = []
-        for _, pr in sku_pos.iterrows():
+        for ev in po_events:
             po_rows.append([
-                str(pr.get("order_number", "")),
-                str(pr.get("eta_date", "")),
-                f"{pr.get('quantity_sy', 0):.1f}",
-                str(pr.get("supplier_number", "")),
+                ev.get("order_number", ""),
+                str(ev.get("eta_date", "")),
+                f"{ev.get('quantity_sy', 0):,.1f}",
+                ev.get("supplier_number", ""),
             ])
+        po_rows.sort(key=lambda r: r[1])
         self._po_table.populate(po_rows)
 
         # Recommendation
-        rec = self._build_recommendation(row, stockout_day, open_pos, sku)
+        rec = self._build_recommendation(row, stockout_day, po_events, sku)
         if rec:
             self._rec_label.setText(rec)
             self._rec_frame.setVisible(True)
         else:
             self._rec_frame.setVisible(False)
 
-    def _build_fig(self, sku: str, df: pd.DataFrame, open_pos: pd.DataFrame):
+    def _build_fig(self, sku: str, df: pd.DataFrame, po_events: list):
         c = theme.DARK if theme.is_dark() else theme.LIGHT
         dates = df["date"].tolist()
 
         fig = go.Figure()
 
-        # Inventory area
-        fig.add_trace(go.Scatter(
-            x=dates, y=df["inventory_sy"].tolist(),
-            mode="lines", name="Projected Inventory",
-            line=dict(color=c["accent"], width=2),
-            fill="tozeroy",
-            fillcolor=f"rgba(78,140,255,0.15)",
-        ))
-
-        # PO incoming bars
-        if "incoming_sy" in df.columns:
-            inc = df[df["incoming_sy"] > 0]
-            if not inc.empty:
-                fig.add_trace(go.Bar(
-                    x=inc["date"].tolist(), y=inc["incoming_sy"].tolist(),
-                    name="PO Receipt", marker_color=c["success"],
-                    opacity=0.8,
-                ))
-
-        # Stockout zone
+        # ── Stockout zone ──────────────────────────────────────────────────
         so = df[df["stockout"]]
         if not so.empty:
             fig.add_vrect(
                 x0=so.iloc[0]["date"], x1=df.iloc[-1]["date"],
-                fillcolor=f"rgba(224,82,96,0.10)",
+                fillcolor="rgba(224,82,96,0.12)",
                 layer="below", line_width=0,
                 annotation_text="Stockout Zone",
                 annotation_position="top left",
                 annotation_font_color=c["danger"],
             )
+
+        # ── Inventory projection area ──────────────────────────────────────
+        fig.add_trace(go.Scatter(
+            x=dates, y=df["inventory_sy"].tolist(),
+            mode="lines", name="Projected Inventory",
+            line=dict(color=c["accent"], width=2.5),
+            fill="tozeroy",
+            fillcolor="rgba(78,140,255,0.12)",
+            hovertemplate="<b>%{x|%b %d}</b><br>Inventory: %{y:,.1f} SY<extra></extra>",
+        ))
+
+        # ── PO receipt vertical lines + markers ────────────────────────────
+        receipt_totals: dict = {}
+        receipt_orders: dict = {}
+        for ev in po_events:
+            d = ev.get("eta_date")
+            if d and pd.notna(d):
+                receipt_totals[d] = receipt_totals.get(d, 0.0) + ev.get("quantity_sy", 0)
+                receipt_orders.setdefault(d, []).append(ev.get("order_number", ""))
+
+        if receipt_totals:
+            receipt_dates = list(receipt_totals.keys())
+            receipt_qtys  = [receipt_totals[d] for d in receipt_dates]
+
+            df_idx = df.set_index("date")
+            receipt_y_on_curve = []
+            for d in receipt_dates:
+                if d in df_idx.index:
+                    receipt_y_on_curve.append(df_idx.loc[d, "inventory_sy"])
+                else:
+                    receipt_y_on_curve.append(0)
+
+            fig.add_trace(go.Scatter(
+                x=receipt_dates,
+                y=receipt_y_on_curve,
+                mode="markers",
+                name="PO Receipt",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=14,
+                    color=c["success"],
+                    line=dict(color=c["success"], width=2),
+                ),
+                customdata=[[receipt_totals[d], ", ".join(receipt_orders[d])] for d in receipt_dates],
+                hovertemplate=(
+                    "<b>PO Receipt — %{x|%b %d, %Y}</b><br>"
+                    "Incoming: <b>%{customdata[0]:,.1f} SY</b><br>"
+                    "Order(s): %{customdata[1]}<extra></extra>"
+                ),
+            ))
+
+            for d, qty in receipt_totals.items():
+                fig.add_vline(
+                    x=str(d),
+                    line=dict(color=c["success"], width=1.5, dash="dot"),
+                    annotation_text=f"+{qty:,.0f} SY",
+                    annotation_position="top",
+                    annotation_font=dict(color=c["success"], size=11),
+                    annotation_bgcolor="rgba(0,0,0,0)",
+                )
 
         fig.update_layout(
             paper_bgcolor=c["chart_bg"],
@@ -272,7 +318,7 @@ class TimelineTab(QWidget):
         )
         return fig
 
-    def _build_recommendation(self, row, stockout_day, open_pos, sku: str) -> str:
+    def _build_recommendation(self, row, stockout_day, po_events: list, sku: str) -> str:
         avg_daily = float(row.get("avg_daily_sales_sy", 0))
         inv_sy = float(row.get("inventory_sy", 0))
         on_order = float(row.get("on_order_sy", 0))
@@ -286,7 +332,7 @@ class TimelineTab(QWidget):
         target_qty = avg_daily * target_doi
         needed = max(target_qty - inv_sy - on_order, 0)
 
-        if stockout_day and on_order == 0:
+        if stockout_day and not po_events:
             from datetime import date
             days_until = (stockout_day - date.today()).days
             return (

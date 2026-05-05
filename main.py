@@ -34,6 +34,9 @@ def main() -> None:
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import Qt
 
+    # Must be set before QApplication is created — required for WebEngine
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+
     app = QApplication(sys.argv)
     app.setApplicationName("Inventory Control")
     app.setOrganizationName("NRF")

@@ -67,13 +67,14 @@ def resolve_target(
     product_line: str = "",
     supplier: str = "",
     sku: str = "",
+    _targets_cache: Optional[dict] = None,
 ) -> tuple[float, list[str]]:
     """Return (target, list_of_matching_keys) — all keys that match this SKU's attributes.
 
-    Caller uses this to detect conflicts (multiple non-global targets) and let the user
-    choose which takes precedence.
+    Pass _targets_cache (from get_all_targets()) to avoid repeated disk reads when
+    resolving targets for thousands of SKUs in a batch.
     """
-    data = get_all_targets()
+    data = _targets_cache if _targets_cache is not None else get_all_targets()
     candidates: list[tuple[str, float]] = []
 
     for key_prefix, value in [

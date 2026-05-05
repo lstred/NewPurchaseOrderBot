@@ -42,7 +42,11 @@ class DatasetBundle:
     open_pos: pd.DataFrame = field(default_factory=pd.DataFrame)
     rolls: pd.DataFrame = field(default_factory=pd.DataFrame)
     pending_pos: pd.DataFrame = field(default_factory=pd.DataFrame)
-    timeline: dict[str, pd.DataFrame] = field(default_factory=dict)
+    # po_events: {base_sku: [{order_number, eta_date, quantity_sy, supplier_number}, ...]}
+    # Used for the PO table and on-demand timeline building (replaces pre-built timeline dict)
+    po_events: dict = field(default_factory=dict)
+    # timeline: lazily populated by get_sku_timeline() — only built for SKUs actually viewed
+    timeline: dict = field(default_factory=dict)
     filter_values: pd.DataFrame = field(default_factory=pd.DataFrame)
     summary: dict = field(default_factory=dict)
     refresh_info: dict = field(default_factory=dict)  # {refreshed: [...], cached: [...], ts_ok: bool}
@@ -140,8 +144,9 @@ def compute_all(
             launch_dates,
         )
 
-        # Build timeline
-        bundle.timeline = _build_timelines(bundle.sku_metrics, open_pos, end_date)
+        # Build lightweight po_events dict (cheap — just aggregates open_pos rows)
+        # Full timelines are built lazily via get_sku_timeline() when a SKU is viewed
+        bundle.po_events = _build_po_events(open_pos)
 
         # Portfolio-level summary
         bundle.summary = _compute_summary(bundle.sku_metrics)
@@ -246,19 +251,18 @@ def _compute_sku_metrics(
 
     # --- Inventory (rolls) ---
     if not rolls.empty:
+        # Vectorized weighted average age — much faster than groupby.apply()
+        _r = rolls.copy()
+        _r["_age_w"] = _r["quantity_sy"] * _r["age_days"]
         inv_agg = (
-            rolls.groupby("base_sku")
-            .apply(
-                lambda g: pd.Series({
-                    "inventory_sy": g["quantity_sy"].sum(),
-                    "inventory_age_days": (
-                        (g["quantity_sy"] * g["age_days"]).sum() / g["quantity_sy"].sum()
-                        if g["quantity_sy"].sum() > 0 else 0.0
-                    ),
-                })
-            )
+            _r.groupby("base_sku")
+            .agg(inventory_sy=("quantity_sy", "sum"), _age_w_sum=("_age_w", "sum"))
             .reset_index()
         )
+        inv_agg["inventory_age_days"] = (
+            inv_agg["_age_w_sum"] / inv_agg["inventory_sy"].replace(0, np.nan)
+        ).fillna(0.0)
+        inv_agg = inv_agg.drop(columns=["_age_w_sum"])
     else:
         inv_agg = pd.DataFrame(columns=["base_sku", "inventory_sy", "inventory_age_days"])
 
@@ -349,7 +353,9 @@ def _compute_sku_metrics(
     # Launch dates (passed from compute_all — already updated before this call)
     m["launch_date"] = m["base_sku"].map(launch_dates)
 
-    # Stock-turn targets (resolved per-SKU attributes)
+    # Stock-turn targets — resolve once per unique attribute combination
+    from app.data.store import get_all_targets as _get_all_targets
+    _all_targets = _get_all_targets()  # single disk read
     m["stockturn_target"] = m.apply(
         lambda row: resolve_target(
             cost_center=str(row.get("cost_center", "")),
@@ -357,6 +363,7 @@ def _compute_sku_metrics(
             product_line=str(row.get("product_line", "")),
             supplier=str(row.get("supplier_number", "")),
             sku=str(row.get("base_sku", "")),
+            _targets_cache=_all_targets,
         )[0],
         axis=1,
     )
@@ -382,6 +389,111 @@ def _compute_sku_metrics(
     )
 
     return m.rename(columns={"base_sku": "sku"})
+
+
+# ---------------------------------------------------------------------------
+# PO events (lightweight — replaces pre-built timeline dict)
+# ---------------------------------------------------------------------------
+
+def _build_po_events(open_pos: pd.DataFrame) -> dict:
+    """
+    Build {base_sku: [{'order_number', 'eta_date', 'quantity_sy', 'supplier_number'}, ...]}
+    from the filtered open_pos DataFrame.  Cheap to build (no loops per day).
+    """
+    events: dict = {}
+    if open_pos.empty:
+        return events
+    for _, row in open_pos.iterrows():
+        sku = str(row.get("base_sku", row.get("sku", ""))).strip()
+        eta = row.get("eta_date")
+        qty = float(row.get("quantity_sy", 0))
+        if qty <= 0 or not pd.notna(eta):
+            continue
+        events.setdefault(sku, []).append({
+            "order_number":   str(row.get("order_number", "")),
+            "eta_date":       eta,
+            "quantity_sy":    qty,
+            "supplier_number": str(row.get("supplier_number", "")),
+        })
+    return events
+
+
+def get_sku_timeline(sku: str, bundle: "DatasetBundle") -> Optional[pd.DataFrame]:
+    """
+    Return (and cache) the 180-day inventory projection DataFrame for a single SKU.
+    Builds lazily the first time a SKU is requested — avoids building 17 000+ DFs up front.
+    """
+    if sku in bundle.timeline:
+        return bundle.timeline[sku]
+
+    row_df = bundle.sku_metrics[bundle.sku_metrics["sku"] == sku]
+    if row_df.empty:
+        return None
+
+    row = row_df.iloc[0]
+    df = _build_single_timeline(
+        inv_sy=float(row.get("inventory_sy", 0)),
+        avg_daily=float(row.get("avg_daily_sales_sy", 0)),
+        bo_qty=float(row.get("strict_bo_qty_sy", 0)),
+        lead_time=int(row.get("lead_time_days", 30)),
+        po_events=bundle.po_events.get(sku, []),
+    )
+    bundle.timeline[sku] = df  # cache for subsequent views
+    return df
+
+
+def _build_single_timeline(
+    inv_sy: float,
+    avg_daily: float,
+    bo_qty: float,
+    lead_time: int,
+    po_events: list,           # list of {'eta_date': date, 'quantity_sy': float}
+    horizon: int = 180,
+) -> pd.DataFrame:
+    """Build a horizon-day forward projection for one SKU."""
+    today = date.today()
+    dates = [today + timedelta(days=i) for i in range(horizon + 1)]
+
+    # Map eta_date → total incoming qty for fast day lookup
+    receipt_by_day: dict[date, float] = {}
+    for ev in po_events:
+        d = ev["eta_date"]
+        if pd.notna(d):
+            receipt_by_day[d] = receipt_by_day.get(d, 0.0) + ev["quantity_sy"]
+
+    records = []
+    current_inv = inv_sy
+    remaining_bo = bo_qty
+    has_pos = bool(po_events)
+
+    for i, d in enumerate(dates):
+        incoming = receipt_by_day.get(d, 0.0)
+        consumed = avg_daily
+        if i == 0:
+            current_inv = max(current_inv - remaining_bo, 0)
+        current_inv = max(current_inv + incoming - consumed, 0)
+        records.append({
+            "date":         d,
+            "inventory_sy": round(current_inv, 2),
+            "incoming_sy":  round(incoming, 2),
+            "consumed_sy":  round(consumed, 2),
+            "stockout":     current_inv <= 0 and avg_daily > 0,
+        })
+
+    # If no POs: mark hypothetical reorder/receipt day
+    if not has_pos:
+        days_left = inv_sy / avg_daily if avg_daily > 0 else _INF
+        reorder_idx  = int(days_left) if days_left < _INF else -1
+        receipt_idx  = reorder_idx + lead_time if reorder_idx >= 0 else -1
+        for idx, rec in enumerate(records):
+            rec["reorder_point"]       = (idx == reorder_idx)
+            rec["hypothetical_receipt"] = (idx == receipt_idx)
+    else:
+        for rec in records:
+            rec["reorder_point"]       = False
+            rec["hypothetical_receipt"] = False
+
+    return pd.DataFrame(records)
 
 
 def _assign_ratings(df: pd.DataFrame) -> pd.DataFrame:
@@ -419,80 +531,6 @@ def _update_launch_dates(orders: pd.DataFrame, rolls: pd.DataFrame) -> None:
         for sku, d in earliest_rolls.items():
             if pd.notna(d):
                 set_launch_date(str(sku), d)
-
-
-def _build_timelines(
-    sku_metrics: pd.DataFrame,
-    open_pos: pd.DataFrame,
-    end_date: date,
-) -> dict[str, pd.DataFrame]:
-    """Build a 180-day forward projection per SKU."""
-    today = date.today()
-    horizon = 180
-    dates = [today + timedelta(days=i) for i in range(horizon + 1)]
-
-    timelines: dict[str, pd.DataFrame] = {}
-
-    if sku_metrics.empty:
-        return timelines
-
-    # Group open POs by SKU → list of (eta_date, qty_sy)
-    po_events: dict[str, list[tuple[date, float]]] = {}
-    if not open_pos.empty:
-        for _, row in open_pos.iterrows():
-            sku = str(row.get("base_sku", row.get("sku", "")))
-            eta = row.get("eta_date")
-            qty = float(row.get("quantity_sy", 0))
-            if qty > 0 and pd.notna(eta):
-                po_events.setdefault(sku, []).append((eta, qty))
-
-    for _, row in sku_metrics.iterrows():
-        sku = str(row["sku"])
-        inv_sy = float(row.get("inventory_sy", 0))
-        avg_daily = float(row.get("avg_daily_sales_sy", 0))
-        bo_qty = float(row.get("strict_bo_qty_sy", 0))
-        lead_time = int(row.get("lead_time_days", 30))
-
-        records = []
-        current_inv = inv_sy
-        remaining_bo = bo_qty
-
-        for i, d in enumerate(dates):
-            # PO receipts arriving today
-            incoming = sum(qty for (eta, qty) in po_events.get(sku, []) if eta == d)
-            # Daily consumption
-            consumed = avg_daily
-
-            # Apply backorder demand immediately on day 0 (already owed)
-            if i == 0:
-                current_inv = max(current_inv - remaining_bo, 0)
-
-            current_inv = max(current_inv + incoming - consumed, 0)
-
-            records.append({
-                "date": d,
-                "inventory_sy": round(current_inv, 2),
-                "incoming_sy": round(incoming, 2),
-                "consumed_sy": round(consumed, 2),
-                "stockout": current_inv <= 0 and avg_daily > 0,
-            })
-
-        # If no POs and will stock out: show next reorder point
-        if not po_events.get(sku):
-            days_left = inv_sy / avg_daily if avg_daily > 0 else _INF
-            reorder_idx = int(days_left) if days_left < _INF else -1
-            receipt_idx = reorder_idx + lead_time if reorder_idx >= 0 else -1
-            for idx, rec in enumerate(records):
-                rec["reorder_point"] = (idx == reorder_idx)
-                rec["hypothetical_receipt"] = (idx == receipt_idx)
-        else:
-            for rec in records:
-                rec["reorder_point"] = False
-                rec["hypothetical_receipt"] = False
-
-        timelines[sku] = pd.DataFrame(records)
-
-    return timelines
 
 
 def _compute_summary(sku_metrics: pd.DataFrame) -> dict:

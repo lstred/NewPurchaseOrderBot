@@ -685,6 +685,8 @@ All JSON files stored at `%APPDATA%\PurchaseOrderBot\`:
 | **Future-dated orders excluded** | `order_entry_date > today` filtered out in `load_orders()` |
 | **Smart refresh** | Before each load, `app.data.cache` queries `sysTableUpdates`; only stale datasets are reloaded from SQL. If ITEM/PRICE/PRODLINE change, all datasets are invalidated (alias map cascade). If sysTableUpdates is unreachable, all datasets reload as a safe fallback. Timestamps + last date range persisted in `refresh_state.json`. Status bar shows `↻ refreshed: ...  ▪  ⚡ cached: ...` after each load. |
 | **Alias resolution uses full items** | `load_orders/open_pos/rolls/pending_pos` are called with the full (unfiltered) items DF so alias maps are complete regardless of active cost-center filter |
+| **Lazy timeline building** | `DatasetBundle.timeline` is populated on-demand via `get_sku_timeline(sku, bundle)` — avoids pre-building 17,000+ DataFrames. `po_events: dict[str, list[dict]]` is built upfront (cheap) and feeds both the PO table and the lazy timeline builder. |
+| **PO chart visibility** | PO receipts shown as dotted vertical lines (`add_vline`) + triangle-up scatter markers with hover tooltips. Old `go.Bar` approach was invisible on a 180-day x-axis scale. |
 
 ---
 
@@ -700,6 +702,10 @@ All JSON files stored at `%APPDATA%\PurchaseOrderBot\`:
 | `sku_selected` double-click now shows timeline popup | `tab_overview.py` | User wanted click-to-popup timeline without leaving the overview | Changed `_on_row_double_clicked` to open `TimelineDialog`; popup has "Open in Timeline Tab" button to still navigate |
 | Timeline popup added to Problem Areas | `tab_problems.py` | User wanted timeline accessible from alert cards | Added `timeline_requested` signal to `AlertCard`, "📈 Timeline" button, wired to `TimelineDialog` in `ProblemAreasTab` |
 | Smart refresh via sysTableUpdates | `cache.py`, `metrics_service.py`, `main_window.py` | Avoid re-querying unchanged tables on every refresh | `cache.py` fetches timestamps from `sysTableUpdates`, compares to saved state, returns stale dataset set; `compute_all()` only reloads stale ones; status bar shows `↻ refreshed / ⚡ cached` breakdown |
+| PO receipt bars invisible on chart | `timeline_popup.py`, `tab_timeline.py` | `go.Bar` traces are ~1px wide on a 180-day scale — invisible | Replaced with `fig.add_vline()` (dotted green lines) + `go.Scatter` triangle-up markers at receipt points; rich hover tooltip shows qty + order numbers |
+| PO table always empty | `timeline_popup.py`, `tab_timeline.py` | Filtering `bundle.open_pos["base_sku"] == sku` on the full unfiltered DF was unreliable | Pre-computed `bundle.po_events: dict[str, list[dict]]` in `_build_po_events()`; popup and tab both consume this directly |
+| App lag / near-freezing on refresh | `metrics_service.py`, `widgets.py` | (a) Pre-building 17,000+ timeline DataFrames (3M+ rows) in `compute_all()`; (b) `resizeRowsToContents()` on 17,000-row table; (c) `groupby().apply()` for inventory age; (d) `resolve_target()` reading JSON file per SKU | (a) Removed `_build_timelines()`; timelines now built lazily via `get_sku_timeline()` only when a SKU is actually viewed; (b) Removed `resizeRowsToContents()`, added `setUpdatesEnabled(False/True)` around populate; (c) Vectorized weighted avg using `groupby().agg()`; (d) Single `get_all_targets()` call + `_targets_cache` param passed through |
+| `AA_ShareOpenGLContexts` warning | `main.py` | Qt attribute must be set before `QApplication` is created | Added `QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)` before `QApplication(sys.argv)` |
 
 ---
 
