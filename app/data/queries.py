@@ -18,13 +18,13 @@ SELECT
     LTRIM(RTRIM(i.IPATT))                  AS item_pattern,
     CAST(COALESCE(NULLIF(i.IDELIV, 0), 0) AS INT) AS item_lead_time_days,
     COALESCE(CAST(i.IWIDTH AS FLOAT), 0)   AS item_width_inches,
-    COALESCE(p.[DESC], '')                 AS price_class_desc,
+    COALESCE(p.[$DESC], '')                AS price_class_desc,
     COALESCE(pl.LNAME, '')                 AS product_line_desc,
     COALESCE(CAST(NULLIF(pl.LDELIV, 0) AS INT), 0) AS product_line_lead_time_days
 FROM dbo.ITEM i
 LEFT JOIN dbo.PRICE p
-       ON LTRIM(RTRIM(p.[PRCCD])) = LTRIM(RTRIM(i.IPRCCD))
-      AND LTRIM(RTRIM(p.[LIST#])) = 'LP'
+       ON LTRIM(RTRIM(p.[$PRCCD])) = LTRIM(RTRIM(i.IPRCCD))
+      AND LTRIM(RTRIM(p.[$LIST#])) = 'LP'
 LEFT JOIN dbo.PRODLINE pl
        ON LTRIM(RTRIM(pl.[LPROD#])) = LTRIM(RTRIM(i.IPRODL))
       AND LTRIM(RTRIM(pl.[LMFGR#])) = LTRIM(RTRIM(i.IMFGR))
@@ -121,13 +121,13 @@ SELECT DISTINCT
     LTRIM(RTRIM(i.ICCTR))  AS cost_center,
     LTRIM(RTRIM(i.[ISUPP#])) AS supplier_number,
     LTRIM(RTRIM(i.IPRCCD)) AS price_class,
-    COALESCE(p.[DESC], '') AS price_class_desc,
+    COALESCE(p.[$DESC], '') AS price_class_desc,
     LTRIM(RTRIM(i.IPRODL)) AS product_line,
     COALESCE(pl.LNAME, '') AS product_line_desc
 FROM dbo.ITEM i
 LEFT JOIN dbo.PRICE p
-       ON LTRIM(RTRIM(p.[PRCCD])) = LTRIM(RTRIM(i.IPRCCD))
-      AND LTRIM(RTRIM(p.[LIST#])) = 'LP'
+       ON LTRIM(RTRIM(p.[$PRCCD])) = LTRIM(RTRIM(i.IPRCCD))
+      AND LTRIM(RTRIM(p.[$LIST#])) = 'LP'
 LEFT JOIN dbo.PRODLINE pl
        ON LTRIM(RTRIM(pl.[LPROD#])) = LTRIM(RTRIM(i.IPRODL))
       AND LTRIM(RTRIM(pl.[LMFGR#])) = LTRIM(RTRIM(i.IMFGR))
