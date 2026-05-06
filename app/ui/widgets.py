@@ -55,6 +55,36 @@ def _contrasting_color(bg_hex: str) -> str:
         return "#ffffff"
 
 
+class NumericTableWidgetItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts numerically when the cell text is a number.
+
+    Handles formatted values: "101,845.8" → 101845.8, "2.76x" → 2.76,
+    "100.0%" → 100.0, "∞" / "—" sort to the end.
+    """
+
+    def __lt__(self, other: "QTableWidgetItem") -> bool:
+        try:
+            return self._sort_key() < other._sort_key()  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            return self._sort_key() < self._key_from_text(other.text())
+
+    def _sort_key(self):
+        return self._key_from_text(self.text())
+
+    @staticmethod
+    def _key_from_text(text: str):
+        s = text.strip()
+        if s in ("—", "", "nan", "None"):
+            return (2, 0.0)   # blanks/dashes sort last
+        if s in ("∞", "inf", "INF"):
+            return (1, 0.0)   # ∞ sorts second-to-last
+        clean = re.sub(r"[^0-9.\-]", "", s)
+        try:
+            return (0, float(clean))
+        except ValueError:
+            return (2, s.lower())  # non-numeric: stable string sort
+
+
 # ---------------------------------------------------------------------------
 # KPI card
 # ---------------------------------------------------------------------------
@@ -204,14 +234,14 @@ class DataTable(QTableWidget):
             cell_overrides: dict[int, tuple[str | None, str | None]] = {}
 
             for rule in self._rules:
-                col_name = rule.get("column", "")
+                eval_col = rule.get("column", "")
                 try:
-                    col_idx = self._column_names.index(col_name)
+                    eval_idx = self._column_names.index(eval_col)
                 except ValueError:
                     continue
-                if col_idx >= len(row_data):
+                if eval_idx >= len(row_data):
                     continue
-                cell_val = str(row_data[col_idx]) if row_data[col_idx] is not None else ""
+                cell_val = str(row_data[eval_idx]) if row_data[eval_idx] is not None else ""
                 if _rule_matches(cell_val, rule.get("op", ">"), str(rule.get("value", ""))):
                     bg = rule.get("bg_color") or None
                     fg = rule.get("fg_color") or None
@@ -221,10 +251,19 @@ class DataTable(QTableWidget):
                     if rule.get("target") == "row":
                         row_bg, row_fg = bg, fg
                     else:
-                        cell_overrides[col_idx] = (bg, fg)
+                        # Apply highlight to a specific column (may differ from evaluated column)
+                        apply_col = rule.get("apply_column", "")
+                        if apply_col:
+                            try:
+                                apply_idx = self._column_names.index(apply_col)
+                            except ValueError:
+                                apply_idx = eval_idx
+                        else:
+                            apply_idx = eval_idx
+                        cell_overrides[apply_idx] = (bg, fg)
 
             for c, val in enumerate(row_data):
-                item = QTableWidgetItem(str(val) if val is not None else "")
+                item = NumericTableWidgetItem(str(val) if val is not None else "")
                 item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
                 # Determine effective colors for this cell

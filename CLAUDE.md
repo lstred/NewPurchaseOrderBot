@@ -747,6 +747,8 @@ All 11 tables confirmed live with data:
 | Color rules text contrast on theme switch | `widgets.py` | Dark bg rule showed white text in dark mode, black text in light mode (hard to read) | Added `_contrasting_color(bg_hex)` — when a rule sets bg_color but no fg_color, auto-computes white or #1a1a1a based on bg luminance; theme-independent |
 | Column widths persisted across sessions | `widgets.py`, `store.py` | Resizing columns reset on app restart | `DataTable(table_id=...)` saves widths via debounced `sectionResized` → `column_widths.json`; `restore_column_widths()` called after prefs restored |
 | Filter cascade removes unavailable options | `widgets.py` | Unavailable filter options were greyed out (disabled) — confusing UX | Changed `_CheckList.set_valid()` to `setVisible(False)` on invalid items (they disappear from list); `show_all()` restores on reset; `get_selected()` only returns visible+checked |
+| Numeric column sorting | `widgets.py` | Columns like Overstock, Inventory (SY), Fill Rate sorted lexicographically instead of numerically | Added `NumericTableWidgetItem` — strips formatting chars (`,`, `%`, `x`) before comparing as float; `∞` sorts after numbers, `—`/blank sort last; used for all `DataTable` cells |
+| Cross-column color rules | `widgets.py`, `overview_dialogs.py` | Color rules could only highlight the evaluated column itself | Added `apply_column` field to rule dict; `AddEditRuleDialog` shows "Highlight Column" dropdown (only when target=Cell) to pick a different column to color; `_refresh_list` displays "Cell → ColName"; backwards compatible (missing `apply_column` defaults to same column) |
 
 ---
 
