@@ -83,7 +83,12 @@ def _vectorised_to_sy(
 
 def load_items() -> pd.DataFrame:
     """Return item master with price class / product line joined."""
-    return read_dataframe(ITEMS_SQL)
+    df = read_dataframe(ITEMS_SQL)
+    if not df.empty:
+        # Strip AS/400 CHAR-column trailing spaces so every join key is clean
+        df["sku"] = df["sku"].str.strip()
+        df["base_sku"] = df["base_sku"].str.strip()
+    return df
 
 
 def load_orders(
@@ -121,6 +126,8 @@ def load_orders(
         df["base_sku"] = df["sku"]
         df["cost_center"] = ""
 
+    # Strip CHAR-column padding BEFORE alias map lookup so keys match items sku
+    df["sku"] = df["sku"].str.strip()
     df["order_line_id"] = df["order_number"].astype(str) + "-" + df["line_number"].astype(str)
     df["backorder_flag"] = df["detail_line_status"].str.upper().isin(["B", "R"])
     df["strict_bo_flag"] = df["detail_line_status"].str.upper() == "B"
@@ -138,6 +145,9 @@ def load_open_pos(items_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     df = read_dataframe(OPEN_PO_ORDERS_SQL)
     if df.empty:
         return df
+
+    # Strip CHAR-column padding before alias map lookup
+    df["sku"] = df["sku"].str.strip()
 
     if items_df is not None and not items_df.empty:
         alias_map = items_df.set_index("sku")["base_sku"].to_dict()
@@ -165,6 +175,9 @@ def load_rolls(items_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     df = read_dataframe(ROLLS_SQL)
     if df.empty:
         return df
+
+    # Strip CHAR-column padding before alias map lookup
+    df["sku"] = df["sku"].str.strip()
 
     if items_df is not None and not items_df.empty:
         alias_map = items_df.set_index("sku")["base_sku"].to_dict()
@@ -194,6 +207,9 @@ def load_pending_pos(items_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     df = read_dataframe(PENDING_PO_SQL)
     if df.empty:
         return df
+
+    # OPENPO_D components are trimmed in SQL, but strip here for consistency
+    df["sku"] = df["sku"].str.strip()
 
     if items_df is not None and not items_df.empty:
         alias_map = items_df.set_index("sku")["base_sku"].to_dict()

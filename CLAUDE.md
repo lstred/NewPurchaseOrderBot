@@ -766,14 +766,24 @@ SQL Server → loaders.py → metrics_service.compute_all() → DatasetBundle
 - Rules referencing common column names ("Fill Rate", "Days of Inv", "Runout Risk", etc.) apply to BOTH PC and SKU table views automatically
 - "◈ Color Rules" button opens `ThresholdRulesDialog` with columns from BOTH tables combined
 
-**FilterSidebar debounce:**
-- All filter changes go through `_schedule_emit()` → QTimer 250ms single-shot
-- Only fires `filters_changed` signal after user stops interacting
-- `populate()` blocks signals during reset to avoid spurious emissions
+**FilterSidebar debounce + cascade:**
+- All checkbox filter changes go through `_on_filter_changed()` which immediately calls `_update_dependent_filters()` (cascade) then starts the 250ms debounce timer
+- `_update_dependent_filters()` blocks all checkbox signals during update to prevent re-entrancy, computes valid options for each dimension using cross-filter from `_full_fv` (filter_values DataFrame), disables and auto-unchecks options that are incompatible with current selections
+- Search box changes go through `_schedule_emit()` (no cascade, just debounce)
+- `_reset()` re-enables all filter items before clearing so none are left permanently disabled
 
 **Smart Refresh:**
 - `cache.py` queries `dbo.sysTableUpdates` on each refresh cycle
 - Only tables with newer timestamps than saved state are reloaded
 - State persisted at `%APPDATA%\PurchaseOrderBot\refresh_state.json`
+
+**AS/400 CHAR column padding (critical — do not remove strip calls):**
+- SQL Server returning data from AS/400-origin tables gives CHAR-padded strings (e.g. `'STCBROWN    '` instead of `'STCBROWN'`)
+- `ITEM.ItemNumber` (aliased as `sku`) is NOT LTRIM/RTRIMmed in ITEMS_SQL — it returns with trailing spaces
+- `_ORDERS.ITEM_MFGR_COLOR_PAT` (aliased as `sku` in orders) similarly has trailing spaces
+- `ROLLS.ItemNumber` has the same CHAR padding issue
+- **Fix applied (2026-05-06):** All loaders strip `df["sku"]` before alias map lookup and `df["base_sku"]` after (in `load_items`). `_compute_sku_metrics()` also strips `base_sku` in all aggregation DataFrames before merging (defense-in-depth). This ensures alias maps, `_filt()`, and all LEFT JOINs use clean, consistent keys.
+- **OPENPO_D** is the exception: its sku is built with `LTRIM(RTRIM())` per component in SQL so it arrives pre-stripped.
+- If zeros appear in Inventory/On Order/Avg Daily despite data existing in the DB, suspect CHAR padding regression — check that `str.strip()` calls are present in all 5 loader functions.
 
 

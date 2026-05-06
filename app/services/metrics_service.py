@@ -287,9 +287,13 @@ def _compute_sku_metrics(
         pend_agg = pd.DataFrame(columns=["base_sku", "po_pending_qty"])
 
     # --- Merge ---
-    # Strip base_sku whitespace (CHAR columns from SQL Server may be padded)
+    # Strip base_sku whitespace — defense-in-depth; loaders already do this,
+    # but aggregation DataFrames may carry any residual padding from cache.
     items = items.copy()
     items["base_sku"] = items["base_sku"].str.strip()
+    for _agg in (sales_agg, inv_agg, po_agg, pend_agg):
+        if not _agg.empty and "base_sku" in _agg.columns:
+            _agg["base_sku"] = _agg["base_sku"].str.strip()
 
     item_base = items.drop_duplicates("base_sku")[
         [
