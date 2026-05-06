@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 from typing import Callable, Optional
 
-from PyQt6.QtCore import Qt, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
@@ -199,13 +199,70 @@ class DataTable(QTableWidget):
 # Filter sidebar
 # ---------------------------------------------------------------------------
 
+class _CheckList(QWidget):
+    """Scrollable group of checkboxes — replaces QListWidget multi-select."""
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._checks: dict[str, QCheckBox] = {}  # value → checkbox
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setMaximumHeight(115)
+        self._scroll.setMinimumHeight(30)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        self._container = QWidget()
+        self._inner = QVBoxLayout(self._container)
+        self._inner.setContentsMargins(2, 2, 2, 2)
+        self._inner.setSpacing(2)
+        self._scroll.setWidget(self._container)
+        lay.addWidget(self._scroll)
+
+    def populate(self, items: list[tuple[str, str]]) -> None:
+        """items: list of (display_label, filter_value)."""
+        # Remove old widgets
+        while self._inner.count():
+            w = self._inner.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        self._checks.clear()
+
+        for label, value in items:
+            cb = QCheckBox(label)
+            cb.setProperty("_fv", value)
+            cb.stateChanged.connect(self.changed)
+            self._inner.addWidget(cb)
+            self._checks[value] = cb
+
+    def get_selected(self) -> list[str]:
+        return [v for v, cb in self._checks.items() if cb.isChecked()]
+
+    def clear_all(self) -> None:
+        for cb in self._checks.values():
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+        self.changed.emit()
+
+    def has_selection(self) -> bool:
+        return any(cb.isChecked() for cb in self._checks.values())
+
+
 class FilterSidebar(QFrame):
     filters_changed = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("sidebar")
-        self.setFixedWidth(220)
+        self.setFixedWidth(215)
 
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -214,138 +271,165 @@ class FilterSidebar(QFrame):
 
         container = QWidget()
         self._layout = QVBoxLayout(container)
-        self._layout.setContentsMargins(12, 12, 12, 12)
-        self._layout.setSpacing(12)
+        self._layout.setContentsMargins(10, 12, 10, 12)
+        self._layout.setSpacing(8)
         self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
+        # Debounce timer — only emit after 250 ms of inactivity
+        self._timer = QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(250)
+        self._timer.timeout.connect(self._emit)
+
+        # Title
         title = SectionTitle("Filters")
         self._layout.addWidget(title)
 
-        # SKU search
-        self._sku_search = self._make_group("Search")
+        # Search box
+        search_gb = self._make_group_box("Search")
         self._sku_input = QLineEdit()
         self._sku_input.setPlaceholderText("SKU or description…")
-        self._sku_input.textChanged.connect(self._emit)
-        self._sku_search.layout().addWidget(self._sku_input)
+        self._sku_input.textChanged.connect(self._schedule_emit)
+        search_gb.layout().addWidget(self._sku_input)
 
-        # Cost center
-        self._cc_group = self._make_group("Cost Center")
-        self._cc_list = self._make_list()
-        self._cc_group.layout().addWidget(self._cc_list)
+        # Checkbox filter groups
+        self._cc_list, _ = self._make_check_group("Cost Center")
+        self._sup_list, _ = self._make_check_group("Supplier")
+        self._pc_list, _ = self._make_check_group("Price Class")
+        self._pl_list, _ = self._make_check_group("Product Line")
 
-        # Supplier
-        self._sup_group = self._make_group("Supplier")
-        self._sup_list = self._make_list()
-        self._sup_group.layout().addWidget(self._sup_list)
-
-        # Price class
-        self._pc_group = self._make_group("Price Class")
-        self._pc_list = self._make_list()
-        self._pc_group.layout().addWidget(self._pc_list)
-
-        # Product line
-        self._pl_group = self._make_group("Product Line")
-        self._pl_list = self._make_list()
-        self._pl_group.layout().addWidget(self._pl_list)
-
-        # SKU rating
-        self._rating_group = self._make_group("SKU Rating")
+        # SKU Rating (fixed 4 options — horizontal checkboxes)
+        rating_gb = self._make_group_box("SKU Rating")
         self._rating_checks: dict[str, QCheckBox] = {}
+        row_lay = QHBoxLayout()
+        row_lay.setSpacing(6)
         for r in ("A", "B", "C", "D"):
-            cb = QCheckBox(f"Rating {r}")
+            cb = QCheckBox(r)
             cb.setChecked(True)
-            cb.stateChanged.connect(self._emit)
-            self._rating_group.layout().addWidget(cb)
+            cb.stateChanged.connect(self._schedule_emit)
+            row_lay.addWidget(cb)
             self._rating_checks[r] = cb
+        row_lay.addStretch()
+        rating_gb.layout().addLayout(row_lay)
 
+        # Reset all button
         btn_reset = QPushButton("Reset Filters")
         btn_reset.setObjectName("flat")
         btn_reset.clicked.connect(self._reset)
         self._layout.addWidget(btn_reset)
-
         self._layout.addStretch()
-        scroll.setWidget(container)
 
+        scroll.setWidget(container)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
 
     # ------------------------------------------------------------------
 
-    def _make_group(self, title: str) -> QGroupBox:
+    def _make_group_box(self, title: str) -> QGroupBox:
         gb = QGroupBox(title)
         vl = QVBoxLayout(gb)
-        vl.setContentsMargins(6, 6, 6, 6)
+        vl.setContentsMargins(6, 4, 6, 6)
         vl.setSpacing(4)
         self._layout.addWidget(gb)
         return gb
 
-    def _make_list(self) -> QListWidget:
-        lw = QListWidget()
-        lw.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
-        lw.setMaximumHeight(120)
-        lw.itemSelectionChanged.connect(self._emit)
-        return lw
+    def _make_check_group(self, title: str) -> tuple:
+        """Group box with a Clear link + _CheckList. Returns (checklist, groupbox)."""
+        gb = QGroupBox(title)
+        vl = QVBoxLayout(gb)
+        vl.setContentsMargins(6, 2, 6, 6)
+        vl.setSpacing(2)
+
+        hdr = QHBoxLayout()
+        hdr.addStretch()
+        clear_btn = QPushButton("Clear")
+        clear_btn.setObjectName("link_btn")
+        clear_btn.setFixedHeight(16)
+        clear_btn.setStyleSheet(
+            f"color: {theme.get('accent')}; border: none; background: transparent; "
+            f"font-size: 11px; padding: 0;"
+        )
+        hdr.addWidget(clear_btn)
+        vl.addLayout(hdr)
+
+        cl = _CheckList()
+        cl.changed.connect(self._schedule_emit)
+        clear_btn.clicked.connect(cl.clear_all)
+        vl.addWidget(cl)
+
+        self._layout.addWidget(gb)
+        return cl, gb
 
     def populate(self, filter_values) -> None:
         import pandas as pd
         if filter_values is None or (isinstance(filter_values, pd.DataFrame) and filter_values.empty):
             return
-        self._populate_list(self._cc_list, sorted(filter_values["cost_center"].dropna().unique().tolist()))
-        self._populate_list(self._sup_list, sorted(filter_values["supplier_number"].dropna().unique().tolist()))
-        # Price class — show description + code
-        pc_items = []
-        for _, row in filter_values[["price_class", "price_class_desc"]].drop_duplicates().dropna().iterrows():
-            label = f"{row['price_class']} — {row['price_class_desc']}" if row["price_class_desc"] else row["price_class"]
-            pc_items.append((label, row["price_class"]))
+
+        # Cost centers — exclude those starting with '1' (internal use only)
+        cc_vals = sorted({
+            str(v) for v in filter_values["cost_center"].dropna().unique()
+            if v and not str(v).startswith("1")
+        })
+        self._cc_list.populate([(v, v) for v in cc_vals])
+
+        # Suppliers — no code-prefix exclusion
+        sup_vals = sorted({
+            str(v) for v in filter_values["supplier_number"].dropna().unique() if v
+        })
+        self._sup_list.populate([(v, v) for v in sup_vals])
+
+        # Price classes — "CODE — Description"
+        pc_df = filter_values[["price_class", "price_class_desc"]].drop_duplicates()
+        pc_items: list[tuple[str, str]] = []
+        for _, row in pc_df.dropna(subset=["price_class"]).iterrows():
+            pc = str(row["price_class"]).strip()
+            desc = str(row.get("price_class_desc", "")).strip()
+            label = f"{pc} — {desc}" if desc and desc not in ("", "nan") else pc
+            if pc:
+                pc_items.append((label, pc))
         pc_items.sort()
-        self._pc_list.clear()
-        for label, code in pc_items:
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, code)
-            self._pc_list.addItem(item)
+        self._pc_list.populate(pc_items)
 
-        pl_items = []
-        for _, row in filter_values[["product_line", "product_line_desc"]].drop_duplicates().dropna().iterrows():
-            label = f"{row['product_line']} — {row['product_line_desc']}" if row["product_line_desc"] else row["product_line"]
-            pl_items.append((label, row["product_line"]))
+        # Product lines — "CODE — Description"
+        pl_df = filter_values[["product_line", "product_line_desc"]].drop_duplicates()
+        pl_items: list[tuple[str, str]] = []
+        for _, row in pl_df.dropna(subset=["product_line"]).iterrows():
+            pl = str(row["product_line"]).strip()
+            desc = str(row.get("product_line_desc", "")).strip()
+            label = f"{pl} — {desc}" if desc and desc not in ("", "nan") else pl
+            if pl:
+                pl_items.append((label, pl))
         pl_items.sort()
-        self._pl_list.clear()
-        for label, code in pl_items:
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, code)
-            self._pl_list.addItem(item)
-
-    def _populate_list(self, lw: QListWidget, values: list) -> None:
-        lw.clear()
-        for v in values:
-            if v and not str(v).startswith("1"):
-                item = QListWidgetItem(str(v))
-                item.setData(Qt.ItemDataRole.UserRole, str(v))
-                lw.addItem(item)
+        self._pl_list.populate(pl_items)
 
     def get_filters(self) -> dict:
-        def selected(lw: QListWidget) -> list:
-            return [lw.item(i).data(Qt.ItemDataRole.UserRole) for i in range(lw.count()) if lw.item(i).isSelected()]
-
         return {
-            "sku_search": self._sku_input.text().strip(),
-            "cost_centers": selected(self._cc_list) or None,
-            "suppliers": selected(self._sup_list) or None,
-            "price_classes": selected(self._pc_list) or None,
-            "product_lines": selected(self._pl_list) or None,
-            "sku_ratings": [r for r, cb in self._rating_checks.items() if cb.isChecked()],
+            "sku_search":   self._sku_input.text().strip(),
+            "cost_centers": self._cc_list.get_selected() or None,
+            "suppliers":    self._sup_list.get_selected() or None,
+            "price_classes": self._pc_list.get_selected() or None,
+            "product_lines": self._pl_list.get_selected() or None,
+            "sku_ratings":  [r for r, cb in self._rating_checks.items() if cb.isChecked()],
         }
+
+    def _schedule_emit(self) -> None:
+        """Restart debounce timer — fires _emit after 250 ms of silence."""
+        self._timer.start()
 
     def _emit(self) -> None:
         self.filters_changed.emit(self.get_filters())
 
     def _reset(self) -> None:
+        self._sku_input.blockSignals(True)
         self._sku_input.clear()
-        for lw in (self._cc_list, self._sup_list, self._pc_list, self._pl_list):
-            lw.clearSelection()
+        self._sku_input.blockSignals(False)
+        for cl in (self._cc_list, self._sup_list, self._pc_list, self._pl_list):
+            cl.clear_all()
         for cb in self._rating_checks.values():
+            cb.blockSignals(True)
             cb.setChecked(True)
+            cb.blockSignals(False)
         self._emit()
 
 

@@ -133,6 +133,7 @@ LEFT JOIN dbo.PRODLINE pl
       AND LTRIM(RTRIM(pl.[LMFGR#])) = LTRIM(RTRIM(i.IMFGR))
 WHERE i.IINVEN = 'Y'
   AND (i.IDISCD IS NULL OR LEN(LTRIM(RTRIM(CAST(i.IDISCD AS VARCHAR)))) < 2)
+  AND LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'
 """
 
 # ---------------------------------------------------------------------------
