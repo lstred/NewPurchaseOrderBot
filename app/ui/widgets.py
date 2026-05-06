@@ -12,8 +12,7 @@ from PyQt6.QtGui import QFont, QColor
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
     QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QLineEdit, QCheckBox, QComboBox, QListWidget,
-    QListWidgetItem, QScrollArea, QSplitter, QGroupBox,
+    QAbstractItemView, QLineEdit, QCheckBox, QScrollArea, QGroupBox,
 )
 
 import app.ui.theme as theme
@@ -255,6 +254,14 @@ class _CheckList(QWidget):
     def has_selection(self) -> bool:
         return any(cb.isChecked() for cb in self._checks.values())
 
+    def set_valid(self, valid_vals: set) -> None:
+        """Disable and uncheck items not in valid_vals (caller must block signals)."""
+        for val, cb in self._checks.items():
+            is_valid = val in valid_vals
+            if not is_valid and cb.isChecked():
+                cb.setChecked(False)
+            cb.setEnabled(is_valid)
+
 
 class FilterSidebar(QFrame):
     filters_changed = pyqtSignal(dict)
@@ -280,6 +287,9 @@ class FilterSidebar(QFrame):
         self._timer.setSingleShot(True)
         self._timer.setInterval(250)
         self._timer.timeout.connect(self._emit)
+
+        # Stored filter_values DataFrame for dynamic cascade updates
+        self._full_fv = None
 
         # Title
         title = SectionTitle("Filters")
@@ -354,7 +364,7 @@ class FilterSidebar(QFrame):
         vl.addLayout(hdr)
 
         cl = _CheckList()
-        cl.changed.connect(self._schedule_emit)
+        cl.changed.connect(self._on_filter_changed)
         clear_btn.clicked.connect(cl.clear_all)
         vl.addWidget(cl)
 
@@ -365,6 +375,9 @@ class FilterSidebar(QFrame):
         import pandas as pd
         if filter_values is None or (isinstance(filter_values, pd.DataFrame) and filter_values.empty):
             return
+
+        # Save for cascade filtering
+        self._full_fv = filter_values
 
         # Cost centers — exclude those starting with '1' (internal use only)
         cc_vals = sorted({
@@ -413,23 +426,104 @@ class FilterSidebar(QFrame):
             "sku_ratings":  [r for r, cb in self._rating_checks.items() if cb.isChecked()],
         }
 
+    def _on_filter_changed(self) -> None:
+        """Called when any checklist checkbox changes: cascade then debounce."""
+        self._update_dependent_filters()
+        self._timer.start()
+
     def _schedule_emit(self) -> None:
-        """Restart debounce timer — fires _emit after 250 ms of silence."""
+        """Debounce for the search box (no cascade needed)."""
         self._timer.start()
 
     def _emit(self) -> None:
         self.filters_changed.emit(self.get_filters())
 
+    def _update_dependent_filters(self) -> None:
+        """Narrow each filter group to only options compatible with other active selections."""
+        import pandas as pd
+
+        fv = self._full_fv
+        if fv is None or not isinstance(fv, pd.DataFrame) or fv.empty:
+            return
+
+        cc_sel  = set(self._cc_list.get_selected())
+        sup_sel = set(self._sup_list.get_selected())
+        pc_sel  = set(self._pc_list.get_selected())
+        pl_sel  = set(self._pl_list.get_selected())
+
+        # Block all checkbox signals to prevent re-entrancy during update
+        all_cbs = [
+            cb
+            for cl in (self._cc_list, self._sup_list, self._pc_list, self._pl_list)
+            for cb in cl._checks.values()
+        ]
+        for cb in all_cbs:
+            cb.blockSignals(True)
+
+        try:
+            if not any((cc_sel, sup_sel, pc_sel, pl_sel)):
+                # Nothing selected — re-enable everything
+                for cl in (self._cc_list, self._sup_list, self._pc_list, self._pl_list):
+                    cl.set_valid(set(cl._checks.keys()))
+            else:
+                cc_valid  = self._compute_valid(
+                    fv, "cost_center",
+                    ("supplier_number", sup_sel), ("price_class", pc_sel), ("product_line", pl_sel))
+                sup_valid = self._compute_valid(
+                    fv, "supplier_number",
+                    ("cost_center", cc_sel), ("price_class", pc_sel), ("product_line", pl_sel))
+                pc_valid  = self._compute_valid(
+                    fv, "price_class",
+                    ("cost_center", cc_sel), ("supplier_number", sup_sel), ("product_line", pl_sel))
+                pl_valid  = self._compute_valid(
+                    fv, "product_line",
+                    ("cost_center", cc_sel), ("supplier_number", sup_sel), ("price_class", pc_sel))
+
+                self._cc_list.set_valid(cc_valid)
+                self._sup_list.set_valid(sup_valid)
+                self._pc_list.set_valid(pc_valid)
+                self._pl_list.set_valid(pl_valid)
+        finally:
+            for cb in all_cbs:
+                cb.blockSignals(False)
+
+    def _compute_valid(self, fv, dim: str, *constraints) -> set:
+        """Return valid values for ``dim`` after applying all other active selections."""
+        import pandas as pd
+
+        mask = pd.Series(True, index=fv.index)
+        for col, sel in constraints:
+            if sel and col in fv.columns:
+                mask &= fv[col].isin(sel)
+        return set(fv.loc[mask, dim].dropna().astype(str).str.strip())
+
     def _reset(self) -> None:
+        """Clear all selections and re-enable every filter item."""
         self._sku_input.blockSignals(True)
         self._sku_input.clear()
         self._sku_input.blockSignals(False)
-        for cl in (self._cc_list, self._sup_list, self._pc_list, self._pl_list):
-            cl.clear_all()
+
+        all_cbs = [
+            cb
+            for cl in (self._cc_list, self._sup_list, self._pc_list, self._pl_list)
+            for cb in cl._checks.values()
+        ]
+        for cb in all_cbs:
+            cb.blockSignals(True)
+        try:
+            for cl in (self._cc_list, self._sup_list, self._pc_list, self._pl_list):
+                for cb in cl._checks.values():
+                    cb.setChecked(False)
+                    cb.setEnabled(True)
+        finally:
+            for cb in all_cbs:
+                cb.blockSignals(False)
+
         for cb in self._rating_checks.values():
             cb.blockSignals(True)
             cb.setChecked(True)
             cb.blockSignals(False)
+
         self._emit()
 
 
