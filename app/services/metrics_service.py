@@ -287,6 +287,10 @@ def _compute_sku_metrics(
         pend_agg = pd.DataFrame(columns=["base_sku", "po_pending_qty"])
 
     # --- Merge ---
+    # Strip base_sku whitespace (CHAR columns from SQL Server may be padded)
+    items = items.copy()
+    items["base_sku"] = items["base_sku"].str.strip()
+
     item_base = items.drop_duplicates("base_sku")[
         [
             "base_sku", "sku_description", "cost_center", "price_class",

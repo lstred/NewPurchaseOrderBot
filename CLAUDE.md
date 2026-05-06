@@ -727,3 +727,53 @@ All 11 tables confirmed live with data:
 | `_INVENTORY` | 5 | TotalCost > 0 |
 | `OPENIV` | 5 | NREFTY='R' |
 
+---
+
+### 12.9 Recent Changes (2026-05-06)
+
+| Change | Files | Reason | Solution |
+|---|---|---|---|
+| Checkbox filter sidebar | `widgets.py` | QListWidget multi-select was hard to use; deselect required Ctrl+click | Rewrote `FilterSidebar` with `_CheckList` (scrollable checkboxes) for CC, Supplier, Price Class, Product Line; horizontal checkboxes for A/B/C/D rating; QTimer 250ms debounce; "Clear" links per group; width 215px |
+| Overview: Price Class view | `tab_overview.py` | User wanted price-class aggregation as default; per-SKU view still accessible | Default view now "By Price Class" with `QStackedWidget` switching between PC table and SKU table; toggle buttons in toolbar |
+| Overview: Drill-down dialog | `tab_overview.py` | User wanted to see SKUs within a price class | `PriceClassDetailDialog` — double-click any PC row opens modal with KPI summary cards, full SKU-level table, totals strip |
+| Filter cross-selection fix | `queries.py` | FILTER_VALUES_SQL included CC "1xx" items whose suppliers appeared in sidebar but had no matching SKUs in sku_metrics | Added `AND LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'` to FILTER_VALUES_SQL WHERE clause |
+| Removed "Pending PO" column | `tab_overview.py` | `on_order_sy` (from `_ORDERS`) and `po_pending_qty` (from `OPENPO_D`) showed identical values in practice — confusing duplicate | Removed "Pending PO" column from PC table, SKU table, and detail dialog; `po_pending_qty` still used in `net_inventory_sy` calculation |
+| Duplicate base-SKU rows fix | `metrics_service.py` | SQL Server CHAR columns may return padded strings; two items with same IIXREF but different item numbers both showed as the same base_sku | Added `items["base_sku"] = items["base_sku"].str.strip()` before `drop_duplicates("base_sku")` in `_build_sku_metrics()` |
+| Color rules applied to both tables | `tab_overview.py` | Rules were only set on the SKU table; PC table (default view) never showed colors | `_apply_saved_rules` and `_open_rules_dialog` now call `set_rules()` on both `self._table` and `self._pc_table`; dialog offers combined column list from both views |
+
+---
+
+### 12.10 Architecture Notes
+
+**Data Flow:**
+```
+SQL Server → loaders.py → metrics_service.compute_all() → DatasetBundle
+                                                          ├─ sku_metrics (one row per base_sku)
+                                                          ├─ summary (portfolio KPIs)
+                                                          ├─ filter_values (sidebar options)
+                                                          ├─ po_events (dict[sku, list[dict]])
+                                                          └─ open_pos, orders, rolls, etc.
+```
+
+**Overview Tab Views:**
+- Default: "By Price Class" — aggregates sku_metrics by price_class; shows 1 row per PC
+- "By SKU" — shows all rows in sku_metrics (one per base_sku); double-click → TimelineDialog
+- PC drill-down: double-click price class row → PriceClassDetailDialog (SKU-level + totals)
+
+**Color Rules:**
+- Stored in `%APPDATA%\PurchaseOrderBot\table_rules.json` under key `"overview"`
+- Applied via `DataTable.populate()` using `_rule_matches()` (numeric + string comparison)
+- Rules referencing common column names ("Fill Rate", "Days of Inv", "Runout Risk", etc.) apply to BOTH PC and SKU table views automatically
+- "◈ Color Rules" button opens `ThresholdRulesDialog` with columns from BOTH tables combined
+
+**FilterSidebar debounce:**
+- All filter changes go through `_schedule_emit()` → QTimer 250ms single-shot
+- Only fires `filters_changed` signal after user stops interacting
+- `populate()` blocks signals during reset to avoid spurious emissions
+
+**Smart Refresh:**
+- `cache.py` queries `dbo.sysTableUpdates` on each refresh cycle
+- Only tables with newer timestamps than saved state are reloaded
+- State persisted at `%APPDATA%\PurchaseOrderBot\refresh_state.json`
+
+

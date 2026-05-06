@@ -115,7 +115,7 @@ class PriceClassDetailDialog(QDialog):
         # SKU table
         table_cols = [
             "SKU", "Description", "Rating",
-            "Inventory (SY)", "On Order (SY)", "Pending PO", "Net Inv",
+            "Inventory (SY)", "On Order (SY)", "Net Inv",
             "Avg Daily (SY)", "Days of Inv", "Inv Age (days)", "Fill Rate",
             "Runout Risk", "Days Since Sale", "Turn", "Target Turn",
         ]
@@ -163,7 +163,6 @@ class PriceClassDetailDialog(QDialog):
                 row.get("sku_rating", ""),
                 f"{row.get('inventory_sy', 0):,.1f}",
                 f"{row.get('on_order_sy', 0):,.1f}",
-                f"{row.get('po_pending_qty', 0):,.1f}",
                 f"{row.get('net_inventory_sy', 0):,.1f}",
                 f"{row.get('avg_daily_sales_sy', 0):.2f}",
                 doi_str,
@@ -208,7 +207,7 @@ class OverviewTab(QWidget):
 
     _PC_TABLE_COLS = [
         "Price Class", "Description", "SKUs",
-        "Inventory (SY)", "On Order (SY)", "Pending PO", "Net Inv",
+        "Inventory (SY)", "On Order (SY)", "Net Inv",
         "Avg Daily (SY)", "Days of Inv", "Fill Rate",
         "Runout Risk", "Overstock", "Stock Turn", "Ratings A/B/C/D",
     ]
@@ -330,7 +329,7 @@ class OverviewTab(QWidget):
 
         self._table_cols = [
             "SKU", "Description", "Price Class", "Cost Center", "Rating",
-            "Inventory (SY)", "On Order (SY)", "Pending PO", "Net Inv",
+            "Inventory (SY)", "On Order (SY)", "Net Inv",
             "Avg Daily (SY)", "Orders", "Backorders", "BO Qty (SY)",
             "Days of Inv", "Inv Age (days)", "Fill Rate", "Runout Risk",
             "Days Since Sale", "Launch Date", "Turn", "Target Turn",
@@ -414,7 +413,6 @@ class OverviewTab(QWidget):
 
             inv_sy    = g["inventory_sy"].sum()
             on_order  = g["on_order_sy"].sum()
-            pending   = g["po_pending_qty"].sum()
             net_inv   = g["net_inventory_sy"].sum()
             avg_daily = g["avg_daily_sales_sy"].sum()
             doi       = inv_sy / avg_daily if avg_daily > 0 else _INF
@@ -430,7 +428,7 @@ class OverviewTab(QWidget):
             rows.append([
                 str(pc_code), desc, str(len(g)),
                 f"{inv_sy:,.1f}", f"{on_order:,.1f}",
-                f"{pending:,.1f}", f"{net_inv:,.1f}",
+                f"{net_inv:,.1f}",
                 f"{avg_daily:.2f}",
                 f"{doi:.0f}" if doi < _INF else "∞",
                 f"{fr * 100:.1f}%",
@@ -458,7 +456,6 @@ class OverviewTab(QWidget):
                 row.get("sku_rating", ""),
                 f"{row.get('inventory_sy', 0):,.1f}",
                 f"{row.get('on_order_sy', 0):,.1f}",
-                f"{row.get('po_pending_qty', 0):,.1f}",
                 f"{row.get('net_inventory_sy', 0):,.1f}",
                 f"{row.get('avg_daily_sales_sy', 0):.2f}",
                 str(int(row.get("orders_count", 0))),
@@ -554,7 +551,9 @@ class OverviewTab(QWidget):
 
     def _apply_saved_rules(self) -> None:
         from app.data.store import get_table_rules
-        self._table.set_rules(get_table_rules("overview"))
+        rules = get_table_rules("overview")
+        self._table.set_rules(rules)
+        self._pc_table.set_rules(rules)
 
     def _apply_saved_column_prefs(self) -> None:
         from app.data.store import get_column_prefs
@@ -572,13 +571,16 @@ class OverviewTab(QWidget):
 
     def _open_rules_dialog(self) -> None:
         from app.data.store import get_table_rules, set_table_rules
-        dlg = ThresholdRulesDialog(
-            self._table._column_names, get_table_rules("overview"), self
-        )
+        # Offer columns from both views so rules work across the board
+        all_cols = list(dict.fromkeys(
+            self._table._column_names + self._pc_table._column_names
+        ))
+        dlg = ThresholdRulesDialog(all_cols, get_table_rules("overview"), self)
         if dlg.exec():
             rules = dlg.get_rules()
             set_table_rules("overview", rules)
             self._table.set_rules(rules)
+            self._pc_table.set_rules(rules)
             if self._bundle is not None:
                 filters = self._sidebar.get_filters()
                 self._current_df = self._filter_metrics(
