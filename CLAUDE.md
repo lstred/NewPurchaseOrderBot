@@ -666,6 +666,7 @@ All JSON files stored at `%APPDATA%\PurchaseOrderBot\`:
 | `snooze.json` | Snoozed problem alerts | `"{type}:{sku}": {"until": "YYYY-MM-DD", "po_qty_at_snooze": 0.0}` |
 | `launch_dates.json` | Auto-detected earliest sale/receipt date per SKU | `"{sku}": "YYYY-MM-DD"` |
 | `refresh_state.json` | Smart refresh: last-seen sysTableUpdates timestamps + date range | `{"timestamps": {"DW0001F": "...", "ITEM": "..."}, "date_range": "start:end"}` |
+| `column_widths.json` | Per-table column widths in pixels | `{"overview": {"SKU": 80, ...}, "overview_pc": {...}}` |
 
 ---
 
@@ -743,6 +744,9 @@ All 11 tables confirmed live with data:
 | Color rules applied to both tables | `tab_overview.py` | Rules were only set on the SKU table; PC table (default view) never showed colors | `_apply_saved_rules` and `_open_rules_dialog` now call `set_rules()` on both `self._table` and `self._pc_table`; dialog offers combined column list from both views |
 | Column manager view-mode aware | `tab_overview.py` | "Columns" button always opened dialog for SKU table regardless of active view; PC table columns could never be managed | `_open_column_manager` now checks `_view_mode`: opens dialog for `_pc_table` (key `"overview_pc"`) when in price-class view, or `_table` (key `"overview"`) when in SKU view; `_apply_saved_column_prefs` restores both independently |
 | Columns + Color Rules in detail dialog | `tab_overview.py` | `PriceClassDetailDialog` had no Columns or Color Rules buttons | Added ⚙ Columns and ◈ Color Rules toolbar buttons; column prefs saved under `"overview_detail"` key; color rules shared with `"overview"` key; `_df` stored on dialog for rule repopulation |
+| Color rules text contrast on theme switch | `widgets.py` | Dark bg rule showed white text in dark mode, black text in light mode (hard to read) | Added `_contrasting_color(bg_hex)` — when a rule sets bg_color but no fg_color, auto-computes white or #1a1a1a based on bg luminance; theme-independent |
+| Column widths persisted across sessions | `widgets.py`, `store.py` | Resizing columns reset on app restart | `DataTable(table_id=...)` saves widths via debounced `sectionResized` → `column_widths.json`; `restore_column_widths()` called after prefs restored |
+| Filter cascade removes unavailable options | `widgets.py` | Unavailable filter options were greyed out (disabled) — confusing UX | Changed `_CheckList.set_valid()` to `setVisible(False)` on invalid items (they disappear from list); `show_all()` restores on reset; `get_selected()` only returns visible+checked |
 
 ---
 

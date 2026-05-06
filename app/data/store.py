@@ -251,3 +251,23 @@ def set_table_rules(table_id: str, rules: list[dict]) -> None:
     data = _load(_TABLE_RULES_FILE)
     data[table_id] = rules
     _save(_TABLE_RULES_FILE, data)
+
+
+# ---------------------------------------------------------------------------
+# Column width preferences
+# Key: table_id  Value: {column_name: pixel_width}
+# ---------------------------------------------------------------------------
+
+_COLUMN_WIDTHS_FILE = APPDATA_DIR / "column_widths.json"
+
+
+def get_column_widths(table_id: str) -> dict[str, int]:
+    """Return {column_name: width_pixels} for the given table."""
+    data = _load(_COLUMN_WIDTHS_FILE)
+    return {k: int(v) for k, v in data.get(table_id, {}).items()}
+
+
+def set_column_widths(table_id: str, widths: dict[str, int]) -> None:
+    data = _load(_COLUMN_WIDTHS_FILE)
+    data[table_id] = {k: int(v) for k, v in widths.items()}
+    _save(_COLUMN_WIDTHS_FILE, data)

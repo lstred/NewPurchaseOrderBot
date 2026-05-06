@@ -45,6 +45,16 @@ def _rule_matches(cell_val: str, op: str, threshold: str) -> bool:
     return False
 
 
+def _contrasting_color(bg_hex: str) -> str:
+    """Return #ffffff or #1a1a1a whichever contrasts better against bg_hex."""
+    try:
+        c = QColor(bg_hex)
+        luminance = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        return "#ffffff" if luminance < 128 else "#1a1a1a"
+    except Exception:
+        return "#ffffff"
+
+
 # ---------------------------------------------------------------------------
 # KPI card
 # ---------------------------------------------------------------------------
@@ -109,10 +119,11 @@ class HSep(QFrame):
 # ---------------------------------------------------------------------------
 
 class DataTable(QTableWidget):
-    def __init__(self, columns: list[str], parent=None):
+    def __init__(self, columns: list[str], parent=None, table_id: str | None = None):
         super().__init__(0, len(columns), parent)
         self._column_names: list[str] = list(columns)
         self._rules: list[dict] = []
+        self._table_id: str | None = table_id
         self.setHorizontalHeaderLabels(columns)
         self.setAlternatingRowColors(True)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -123,6 +134,16 @@ class DataTable(QTableWidget):
         self.horizontalHeader().setSectionsMovable(True)  # drag-to-reorder
         self.verticalHeader().setVisible(False)
         self.setShowGrid(True)
+
+        # Persist column widths when user resizes — debounced 600 ms
+        if table_id:
+            self._width_timer = QTimer(self)
+            self._width_timer.setSingleShot(True)
+            self._width_timer.setInterval(600)
+            self._width_timer.timeout.connect(self._save_column_widths)
+            self.horizontalHeader().sectionResized.connect(
+                lambda *_: self._width_timer.start()
+            )
 
     # ------------------------------------------------------------------
     # Column visibility
@@ -135,6 +156,31 @@ class DataTable(QTableWidget):
             self.setColumnHidden(idx, not visible)
         except ValueError:
             pass
+
+    def restore_column_widths(self) -> None:
+        """Restore saved column widths (call after applying column visibility prefs)."""
+        if not self._table_id:
+            return
+        from app.data.store import get_column_widths
+        widths = get_column_widths(self._table_id)
+        for col_name, width in widths.items():
+            try:
+                idx = self._column_names.index(col_name)
+                self.setColumnWidth(idx, max(width, 20))
+            except ValueError:
+                pass
+
+    def _save_column_widths(self) -> None:
+        """Persist current column widths to disk."""
+        if not self._table_id:
+            return
+        from app.data.store import set_column_widths
+        widths = {
+            col: self.columnWidth(i)
+            for i, col in enumerate(self._column_names)
+            if not self.isColumnHidden(i)
+        }
+        set_column_widths(self._table_id, widths)
 
     # ------------------------------------------------------------------
     # Threshold coloring rules
@@ -169,6 +215,9 @@ class DataTable(QTableWidget):
                 if _rule_matches(cell_val, rule.get("op", ">"), str(rule.get("value", ""))):
                     bg = rule.get("bg_color") or None
                     fg = rule.get("fg_color") or None
+                    # Auto-contrast: if bg is set but fg is empty, pick readable text color
+                    if bg and not fg:
+                        fg = _contrasting_color(bg)
                     if rule.get("target") == "row":
                         row_bg, row_fg = bg, fg
                     else:
@@ -242,7 +291,7 @@ class _CheckList(QWidget):
             self._checks[value] = cb
 
     def get_selected(self) -> list[str]:
-        return [v for v, cb in self._checks.items() if cb.isChecked()]
+        return [v for v, cb in self._checks.items() if cb.isChecked() and cb.isVisible()]
 
     def clear_all(self) -> None:
         for cb in self._checks.values():
@@ -255,12 +304,17 @@ class _CheckList(QWidget):
         return any(cb.isChecked() for cb in self._checks.values())
 
     def set_valid(self, valid_vals: set) -> None:
-        """Disable and uncheck items not in valid_vals (caller must block signals)."""
+        """Hide and uncheck items not in valid_vals; show items that are valid."""
         for val, cb in self._checks.items():
             is_valid = val in valid_vals
             if not is_valid and cb.isChecked():
                 cb.setChecked(False)
-            cb.setEnabled(is_valid)
+            cb.setVisible(is_valid)
+
+    def show_all(self) -> None:
+        """Make all items visible again (used on filter reset)."""
+        for cb in self._checks.values():
+            cb.setVisible(True)
 
 
 class FilterSidebar(QFrame):
@@ -462,9 +516,9 @@ class FilterSidebar(QFrame):
 
         try:
             if not any((cc_sel, sup_sel, pc_sel, pl_sel)):
-                # Nothing selected — re-enable everything
+                # Nothing selected — show everything
                 for cl in (self._cc_list, self._sup_list, self._pc_list, self._pl_list):
-                    cl.set_valid(set(cl._checks.keys()))
+                    cl.show_all()
             else:
                 cc_valid  = self._compute_valid(
                     fv, "cost_center",
@@ -498,7 +552,7 @@ class FilterSidebar(QFrame):
         return set(fv.loc[mask, dim].dropna().astype(str).str.strip())
 
     def _reset(self) -> None:
-        """Clear all selections and re-enable every filter item."""
+        """Clear all selections and restore all filter items."""
         self._sku_input.blockSignals(True)
         self._sku_input.clear()
         self._sku_input.blockSignals(False)
@@ -514,7 +568,7 @@ class FilterSidebar(QFrame):
             for cl in (self._cc_list, self._sup_list, self._pc_list, self._pl_list):
                 for cb in cl._checks.values():
                     cb.setChecked(False)
-                    cb.setEnabled(True)
+                    cb.setVisible(True)
         finally:
             for cb in all_cbs:
                 cb.blockSignals(False)

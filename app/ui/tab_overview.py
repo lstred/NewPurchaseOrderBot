@@ -135,13 +135,14 @@ class PriceClassDetailDialog(QDialog):
             "Runout Risk", "Days Since Sale", "Launch Date", "Lead Time (days)",
             "Turn", "Target Turn",
         ]
-        self._table = DataTable(table_cols)
+        self._table = DataTable(table_cols, table_id="overview_detail")
         self._table.cellDoubleClicked.connect(self._on_double_click)
         self._table.setToolTip("Double-click to view inventory timeline")
         from app.data.store import get_table_rules, get_column_prefs
         self._table.set_rules(get_table_rules("overview"))
         for col, visible in get_column_prefs("overview_detail").items():
             self._table.set_column_visible(col, visible)
+        self._table.restore_column_widths()
 
         # Wire toolbar buttons (defined above, before the table)
         btn_detail_cols.clicked.connect(self._open_column_manager)
@@ -365,7 +366,7 @@ class OverviewTab(QWidget):
         # Stacked tables
         self._stack = QStackedWidget()
 
-        self._pc_table = DataTable(self._PC_TABLE_COLS)
+        self._pc_table = DataTable(self._PC_TABLE_COLS, table_id="overview_pc")
         self._pc_table.cellDoubleClicked.connect(self._on_pc_double_clicked)
         self._pc_table.setToolTip(
             "Double-click a price class to drill down into its individual SKUs"
@@ -379,7 +380,7 @@ class OverviewTab(QWidget):
             "Days of Inv", "Inv Age (days)", "Fill Rate", "Runout Risk",
             "Days Since Sale", "Launch Date", "Lead Time (days)", "Turn", "Target Turn",
         ]
-        self._table = DataTable(self._table_cols)
+        self._table = DataTable(self._table_cols, table_id="overview")
         self._table.cellDoubleClicked.connect(self._on_sku_double_clicked)
         self._table.setToolTip("Double-click any row to view its inventory timeline")
         self._stack.addWidget(self._table)
@@ -607,6 +608,8 @@ class OverviewTab(QWidget):
             self._table.set_column_visible(col, visible)
         for col, visible in get_column_prefs("overview_pc").items():
             self._pc_table.set_column_visible(col, visible)
+        self._table.restore_column_widths()
+        self._pc_table.restore_column_widths()
 
     def _open_column_manager(self) -> None:
         from app.data.store import set_column_prefs
