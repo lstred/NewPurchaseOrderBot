@@ -782,8 +782,14 @@ SQL Server → loaders.py → metrics_service.compute_all() → DatasetBundle
 - `ITEM.ItemNumber` (aliased as `sku`) is NOT LTRIM/RTRIMmed in ITEMS_SQL — it returns with trailing spaces
 - `_ORDERS.ITEM_MFGR_COLOR_PAT` (aliased as `sku` in orders) similarly has trailing spaces
 - `ROLLS.ItemNumber` has the same CHAR padding issue
-- **Fix applied (2026-05-06):** All loaders strip `df["sku"]` before alias map lookup and `df["base_sku"]` after (in `load_items`). `_compute_sku_metrics()` also strips `base_sku` in all aggregation DataFrames before merging (defense-in-depth). This ensures alias maps, `_filt()`, and all LEFT JOINs use clean, consistent keys.
+- **Fix applied (2026-05-06):** All loaders strip `df["sku"]` BEFORE alias map lookup and `df["base_sku"]` AFTER (defense-in-depth). CRITICAL: the strip in `load_orders()` MUST come before the alias resolution block — if it comes after, `base_sku` is set using the unstripped `sku` as fallback and `_filt()` then can't match it against clean `active_skus`, causing all orders to be dropped (avg_daily = 0).
 - **OPENPO_D** is the exception: its sku is built with `LTRIM(RTRIM())` per component in SQL so it arrives pre-stripped.
-- If zeros appear in Inventory/On Order/Avg Daily despite data existing in the DB, suspect CHAR padding regression — check that `str.strip()` calls are present in all 5 loader functions.
+- If zeros appear in Inventory/On Order/Avg Daily despite data existing in the DB, suspect CHAR padding regression — check that `str.strip()` calls are in the right ORDER in all 5 loader functions (strip sku → alias resolution → strip base_sku).
+
+**Sidebar filters vs. load-time filters (critical design principle):**
+- `compute_all()` always builds `sku_metrics` for ALL non-'1xx' items, regardless of sidebar state. It calls `_apply_item_filters(bundle.items, {})` — empty dict means only the permanent '1xx' CC exclusion applies.
+- Sidebar filter selections (CC, supplier, price class, product line, search, rating) are applied ONLY in the UI display layer via `OverviewTab._filter_metrics()` → called from `apply_filters()`.
+- This ensures every price class / supplier / cost centre is selectable from the sidebar and shows correct data, regardless of what filters were active when the user last clicked "Refresh Data".
+- Do NOT pass sidebar filters into `_apply_item_filters()` from `compute_all()`. The `filters` param passed into `compute_all()` is kept for future use but must not narrow the items scope.
 
 

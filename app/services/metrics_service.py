@@ -93,8 +93,12 @@ def compute_all(
             bundle.error = "No item data returned. Check database connection."
             return bundle
 
-        # Apply user filters to item master (for scoping metrics)
-        items = _apply_item_filters(bundle.items, filters)
+        # Always build sku_metrics for ALL non-'1xx' items.
+        # Sidebar filters (CC, supplier, price class, etc.) are UI-only and applied
+        # in OverviewTab._filter_metrics() — not at load time.  This ensures every
+        # price class / supplier / cost centre is accessible via the sidebar regardless
+        # of what was selected when the user last hit "Refresh Data".
+        items = _apply_item_filters(bundle.items, {})
         active_skus = set(items["base_sku"].unique())
 
         # ── orders (use FULL items for alias resolution, not filtered) ────────

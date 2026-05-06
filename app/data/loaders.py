@@ -110,10 +110,14 @@ def load_orders(
     today = date.today()
     df = df[df["order_entry_date"].notna() & (df["order_entry_date"] <= today)]
 
+    # Strip CHAR-column padding BEFORE alias map lookup so keys match item sku
+    df["sku"] = df["sku"].str.strip()
+
     # Alias resolution
     if items_df is not None and not items_df.empty:
         alias_map = items_df.set_index("sku")["base_sku"].to_dict()
         df["base_sku"] = df["sku"].map(alias_map).fillna(df["sku"])
+        df["base_sku"] = df["base_sku"].str.strip()  # defense-in-depth
         # Also carry width from item master where order-level width is 0
         width_map = items_df.set_index("base_sku")["item_width_inches"].to_dict()
         df["width_resolved"] = df["base_sku"].map(width_map).fillna(0)
@@ -126,8 +130,6 @@ def load_orders(
         df["base_sku"] = df["sku"]
         df["cost_center"] = ""
 
-    # Strip CHAR-column padding BEFORE alias map lookup so keys match items sku
-    df["sku"] = df["sku"].str.strip()
     df["order_line_id"] = df["order_number"].astype(str) + "-" + df["line_number"].astype(str)
     df["backorder_flag"] = df["detail_line_status"].str.upper().isin(["B", "R"])
     df["strict_bo_flag"] = df["detail_line_status"].str.upper() == "B"
@@ -152,6 +154,7 @@ def load_open_pos(items_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     if items_df is not None and not items_df.empty:
         alias_map = items_df.set_index("sku")["base_sku"].to_dict()
         df["base_sku"] = df["sku"].map(alias_map).fillna(df["sku"])
+        df["base_sku"] = df["base_sku"].str.strip()  # defense-in-depth
         width_map = items_df.set_index("base_sku")["item_width_inches"].to_dict()
         df["width_resolved"] = df["base_sku"].map(width_map).fillna(0)
         df["item_width_inches"] = df["item_width_inches"].where(
@@ -182,6 +185,7 @@ def load_rolls(items_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     if items_df is not None and not items_df.empty:
         alias_map = items_df.set_index("sku")["base_sku"].to_dict()
         df["base_sku"] = df["sku"].map(alias_map).fillna(df["sku"])
+        df["base_sku"] = df["base_sku"].str.strip()  # defense-in-depth
         width_map = items_df.set_index("base_sku")["item_width_inches"].to_dict()
         df["item_width_inches"] = df["base_sku"].map(width_map).fillna(0)
         cc_map = items_df.set_index("base_sku")["cost_center"].to_dict()
@@ -214,6 +218,7 @@ def load_pending_pos(items_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     if items_df is not None and not items_df.empty:
         alias_map = items_df.set_index("sku")["base_sku"].to_dict()
         df["base_sku"] = df["sku"].map(alias_map).fillna(df["sku"])
+        df["base_sku"] = df["base_sku"].str.strip()  # defense-in-depth
         width_map = items_df.set_index("base_sku")["item_width_inches"].to_dict()
         df["item_width_inches"] = df["base_sku"].map(width_map).fillna(0)
         cc_map = items_df.set_index("base_sku")["cost_center"].to_dict()
