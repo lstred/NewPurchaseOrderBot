@@ -48,6 +48,7 @@ class PriceClassDetailDialog(QDialog):
                  bundle: DatasetBundle, parent=None):
         super().__init__(parent)
         self._bundle = bundle
+        self._df = df
         self.setWindowTitle(f"Price Class: {pc_code}")
         self.setMinimumSize(1200, 680)
         self.resize(1360, 740)
@@ -72,6 +73,20 @@ class PriceClassDetailDialog(QDialog):
         hdr.addStretch()
         root.addLayout(hdr)
         root.addWidget(HSep())
+
+        # Toolbar: Columns + Color Rules
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+        btn_detail_cols = QPushButton("⚙  Columns")
+        btn_detail_cols.setObjectName("flat")
+        btn_detail_cols.setToolTip("Show, hide, or reorder columns in this dialog")
+        btn_detail_rules = QPushButton("◈  Color Rules")
+        btn_detail_rules.setObjectName("flat")
+        btn_detail_rules.setToolTip("Define threshold-based row/cell highlight rules")
+        toolbar.addWidget(btn_detail_cols)
+        toolbar.addWidget(btn_detail_rules)
+        toolbar.addStretch()
+        root.addLayout(toolbar)
 
         # KPI summary cards
         inv_sy    = df["inventory_sy"].sum()
@@ -122,8 +137,14 @@ class PriceClassDetailDialog(QDialog):
         self._table = DataTable(table_cols)
         self._table.cellDoubleClicked.connect(self._on_double_click)
         self._table.setToolTip("Double-click to view inventory timeline")
-        from app.data.store import get_table_rules
+        from app.data.store import get_table_rules, get_column_prefs
         self._table.set_rules(get_table_rules("overview"))
+        for col, visible in get_column_prefs("overview_detail").items():
+            self._table.set_column_visible(col, visible)
+
+        # Wire toolbar buttons (defined above, before the table)
+        btn_detail_cols.clicked.connect(self._open_column_manager)
+        btn_detail_rules.clicked.connect(self._open_rules_dialog)
 
         rows, totals = self._build_rows(df)
         self._table.populate(rows)
@@ -189,6 +210,27 @@ class PriceClassDetailDialog(QDialog):
             "Fill Rate":  f"{fr_tot*100:.1f}%",
         }
         return rows, totals
+
+    def _open_column_manager(self) -> None:
+        from app.data.store import get_column_prefs, set_column_prefs
+        dlg = ColumnManagerDialog(self._table._column_names, self._table, self)
+        if dlg.exec():
+            prefs = dlg.get_prefs()
+            set_column_prefs("overview_detail", prefs)
+            for col, visible in prefs.items():
+                self._table.set_column_visible(col, visible)
+
+    def _open_rules_dialog(self) -> None:
+        from app.data.store import get_table_rules, set_table_rules
+        dlg = ThresholdRulesDialog(
+            self._table._column_names, get_table_rules("overview"), self
+        )
+        if dlg.exec():
+            rules = dlg.get_rules()
+            set_table_rules("overview", rules)
+            self._table.set_rules(rules)
+            rows, _ = self._build_rows(self._df)
+            self._table.populate(rows)
 
     def _on_double_click(self, row: int, _col: int) -> None:
         item = self._table.item(row, 0)
@@ -559,15 +601,23 @@ class OverviewTab(QWidget):
         from app.data.store import get_column_prefs
         for col, visible in get_column_prefs("overview").items():
             self._table.set_column_visible(col, visible)
+        for col, visible in get_column_prefs("overview_pc").items():
+            self._pc_table.set_column_visible(col, visible)
 
     def _open_column_manager(self) -> None:
         from app.data.store import set_column_prefs
-        dlg = ColumnManagerDialog(self._table._column_names, self._table, self)
+        if self._view_mode == "price_class":
+            tbl = self._pc_table
+            key = "overview_pc"
+        else:
+            tbl = self._table
+            key = "overview"
+        dlg = ColumnManagerDialog(tbl._column_names, tbl, self)
         if dlg.exec():
             prefs = dlg.get_prefs()
-            set_column_prefs("overview", prefs)
+            set_column_prefs(key, prefs)
             for col, visible in prefs.items():
-                self._table.set_column_visible(col, visible)
+                tbl.set_column_visible(col, visible)
 
     def _open_rules_dialog(self) -> None:
         from app.data.store import get_table_rules, set_table_rules
