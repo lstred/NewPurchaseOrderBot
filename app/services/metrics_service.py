@@ -299,7 +299,17 @@ def _compute_sku_metrics(
         if not _agg.empty and "base_sku" in _agg.columns:
             _agg["base_sku"] = _agg["base_sku"].str.strip()
 
-    item_base = items.drop_duplicates("base_sku")[
+    # Sort so direct items (sku == base_sku) come first before drop_duplicates.
+    # This ensures the base item's own price_class / cost_center / etc. are used
+    # rather than an alias item's attributes — which fixes filtering by price class
+    # when alias items from other price classes point to this base SKU.
+    _is_direct = items["sku"].str.strip() == items["base_sku"].str.strip()
+    item_base = (
+        items.assign(_is_direct=_is_direct)
+        .sort_values("_is_direct", ascending=False)  # True (direct) first
+        .drop_duplicates("base_sku")
+        .drop(columns=["_is_direct"])
+    )[
         [
             "base_sku", "sku_description", "cost_center", "price_class",
             "price_class_desc", "supplier_number", "product_line",

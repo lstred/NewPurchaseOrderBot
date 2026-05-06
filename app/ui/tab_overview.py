@@ -132,7 +132,8 @@ class PriceClassDetailDialog(QDialog):
             "SKU", "Description", "Rating",
             "Inventory (SY)", "On Order (SY)", "Net Inv",
             "Avg Daily (SY)", "Days of Inv", "Inv Age (days)", "Fill Rate",
-            "Runout Risk", "Days Since Sale", "Turn", "Target Turn",
+            "Runout Risk", "Days Since Sale", "Launch Date", "Lead Time (days)",
+            "Turn", "Target Turn",
         ]
         self._table = DataTable(table_cols)
         self._table.cellDoubleClicked.connect(self._on_double_click)
@@ -191,6 +192,8 @@ class PriceClassDetailDialog(QDialog):
                 f"{fr * 100:.1f}%",
                 "Yes" if row.get("runout_risk") else "No",
                 _safe_days(row.get("days_since_last_sale")),
+                str(row.get("launch_date")) if pd.notna(row.get("launch_date")) else "—",
+                str(int(row.get("lead_time_days", 30))),
                 f"{row.get('stock_turn', 0):.2f}x",
                 f"{row.get('stockturn_target', 4.0):.1f}x",
             ])
@@ -374,7 +377,7 @@ class OverviewTab(QWidget):
             "Inventory (SY)", "On Order (SY)", "Net Inv",
             "Avg Daily (SY)", "Orders", "Backorders", "BO Qty (SY)",
             "Days of Inv", "Inv Age (days)", "Fill Rate", "Runout Risk",
-            "Days Since Sale", "Launch Date", "Turn", "Target Turn",
+            "Days Since Sale", "Launch Date", "Lead Time (days)", "Turn", "Target Turn",
         ]
         self._table = DataTable(self._table_cols)
         self._table.cellDoubleClicked.connect(self._on_sku_double_clicked)
@@ -509,6 +512,7 @@ class OverviewTab(QWidget):
                 "Yes" if row.get("runout_risk") else "No",
                 _safe_days(row.get("days_since_last_sale")),
                 str(launch) if pd.notna(launch) else "—",
+                str(int(row.get("lead_time_days", 30))),
                 f"{turn:.2f}x",
                 f"{row.get('stockturn_target', 4.0):.1f}x",
             ])
