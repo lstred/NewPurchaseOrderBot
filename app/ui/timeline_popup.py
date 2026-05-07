@@ -39,8 +39,8 @@ class TimelineDialog(QDialog):
         self._chart_widget = None
 
         self.setWindowTitle(f"Inventory Timeline — {sku}")
-        self.setMinimumSize(1020, 660)
-        self.resize(1100, 720)
+        self.setMinimumSize(1020, 820)
+        self.resize(1100, 900)
         self.setWindowFlags(
             Qt.WindowType.Dialog
             | Qt.WindowType.WindowMaximizeButtonHint
@@ -115,6 +115,18 @@ class TimelineDialog(QDialog):
         self._po_table = DataTable(["Order #", "ETA Date", "Qty (SY)", "Supplier"])
         self._po_table.setMaximumHeight(160)
         root.addWidget(self._po_table)
+
+        # --- Monthly sales chart ---
+        root.addWidget(HSep())
+        root.addWidget(QLabel("Monthly Sales — Last 12 Months:"))
+        self._monthly_placeholder = QLabel("Computing monthly sales…")
+        self._monthly_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._monthly_placeholder.setStyleSheet(
+            f"color: {theme.get('text_muted')}; font-size: 13px;"
+        )
+        self._monthly_placeholder.setFixedHeight(200)
+        root.addWidget(self._monthly_placeholder)
+        self._monthly_chart_widget = None
 
         # --- Recommendation banner ---
         self._rec_frame = QFrame()
@@ -215,6 +227,25 @@ class TimelineDialog(QDialog):
             ])
         po_rows.sort(key=lambda r: r[1])
         QTimer.singleShot(80, lambda rows=po_rows: self._po_table.populate(rows))
+
+        # Monthly sales chart — built from bundle.orders (cheap single-SKU groupby)
+        monthly_fig = _build_monthly_chart(sku, bundle)
+        if monthly_fig is not None:
+            if self._monthly_chart_widget is None:
+                self._monthly_chart_widget = make_chart_widget(monthly_fig)
+                self._monthly_chart_widget.setFixedHeight(200)
+                layout = self.layout()
+                for i in range(layout.count()):
+                    wi = layout.itemAt(i)
+                    if wi and wi.widget() is self._monthly_placeholder:
+                        layout.removeWidget(self._monthly_placeholder)
+                        self._monthly_placeholder.hide()
+                        layout.insertWidget(i, self._monthly_chart_widget)
+                        break
+            else:
+                update_chart_widget(self._monthly_chart_widget, monthly_fig)
+        else:
+            self._monthly_placeholder.setText("No sales data for last 12 months.")
 
         # Recommendation
         rec = _build_recommendation(row, stockout_day)
@@ -374,3 +405,59 @@ def _build_recommendation(row: pd.Series, stockout_day) -> str:
             f"{target:.1f}\u00d7 turn target for this period."
         )
     return ""
+
+
+def _build_monthly_chart(sku: str, bundle: DatasetBundle):
+    """Return a plotly Figure of monthly units sold (SY) for the last 12 months, or None."""
+    orders = bundle.orders
+    if orders.empty or "base_sku" not in orders.columns:
+        return None
+
+    from datetime import date as _date
+    today = _date.today()
+    # First day of the month 12 months ago
+    start_month = _date(today.year - 1, today.month, 1)
+
+    sku_orders = orders[
+        (orders["base_sku"].str.strip() == sku.strip()) &
+        (orders["order_entry_date"] >= start_month) &
+        (orders["quantity_sy"] > 0)
+    ].copy()
+
+    if sku_orders.empty:
+        return None
+
+    sku_orders["month_start"] = sku_orders["order_entry_date"].apply(
+        lambda d: _date(d.year, d.month, 1) if pd.notna(d) else None
+    )
+    monthly = (
+        sku_orders.dropna(subset=["month_start"])
+        .groupby("month_start")["quantity_sy"]
+        .sum()
+        .reset_index()
+        .sort_values("month_start")
+    )
+    if monthly.empty:
+        return None
+
+    c = theme.DARK if theme.is_dark() else theme.LIGHT
+    labels = [d.strftime("%b %Y") for d in monthly["month_start"]]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=labels,
+        y=monthly["quantity_sy"].tolist(),
+        marker_color=c["accent"],
+        hovertemplate="<b>%{x}</b><br>Units: %{y:,.1f} SY<extra></extra>",
+    ))
+    fig.update_layout(
+        paper_bgcolor=c["chart_bg"],
+        plot_bgcolor=c["chart_bg"],
+        font=dict(color=c["text"], family="Segoe UI"),
+        title=dict(text="Monthly Sales — Last 12 Months", font=dict(size=13)),
+        xaxis=dict(gridcolor=c["border"], title=""),
+        yaxis=dict(gridcolor=c["border"], title="Units (SY)"),
+        margin=dict(l=55, r=15, t=40, b=45),
+        showlegend=False,
+        bargap=0.25,
+    )
+    return fig

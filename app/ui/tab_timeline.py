@@ -21,6 +21,7 @@ from app.ui.widgets import (
     DataTable, FilterSidebar, SectionTitle, HSep, KpiCard,
     make_chart_widget, update_chart_widget,
 )
+from app.ui.timeline_popup import _build_monthly_chart
 import app.ui.theme as theme
 
 
@@ -29,6 +30,7 @@ class TimelineTab(QWidget):
         super().__init__(parent)
         self._bundle: Optional[DatasetBundle] = None
         self._chart_widget = None
+        self._monthly_chart_widget = None
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -89,6 +91,17 @@ class TimelineTab(QWidget):
         self._po_table = DataTable(["Order #", "ETA Date", "Qty (SY)", "Supplier"])
         self._po_table.setMaximumHeight(180)
         cl.addWidget(self._po_table)
+
+        # Monthly sales chart
+        cl.addWidget(HSep())
+        cl.addWidget(QLabel("Monthly Sales — Last 12 Months:"))
+        self._monthly_placeholder = QLabel("Select a SKU to view monthly sales.")
+        self._monthly_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._monthly_placeholder.setStyleSheet(
+            f"color: {theme.get('text_muted')}; font-size: 13px;"
+        )
+        self._monthly_placeholder.setFixedHeight(200)
+        cl.addWidget(self._monthly_placeholder)
 
         # Recommendation
         self._rec_frame = QFrame()
@@ -219,6 +232,27 @@ class TimelineTab(QWidget):
             ])
         po_rows.sort(key=lambda r: r[1])
         self._po_table.populate(po_rows)
+
+        # Monthly sales chart — cheap single-SKU groupby on already-loaded orders
+        monthly_fig = _build_monthly_chart(sku, self._bundle)
+        if monthly_fig is not None:
+            if self._monthly_chart_widget is None:
+                self._monthly_chart_widget = make_chart_widget(monthly_fig)
+                self._monthly_chart_widget.setFixedHeight(200)
+                layout = self.layout()
+                content_widget = layout.itemAt(1).widget()
+                cl = content_widget.layout()
+                for i in range(cl.count()):
+                    wi = cl.itemAt(i)
+                    if wi and wi.widget() is self._monthly_placeholder:
+                        cl.removeWidget(self._monthly_placeholder)
+                        self._monthly_placeholder.hide()
+                        cl.insertWidget(i, self._monthly_chart_widget)
+                        break
+            else:
+                update_chart_widget(self._monthly_chart_widget, monthly_fig)
+        else:
+            self._monthly_placeholder.setText("No sales data for last 12 months.")
 
         # Recommendation
         rec = self._build_recommendation(row, stockout_day, po_events, sku)

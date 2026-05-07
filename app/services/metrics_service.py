@@ -358,13 +358,14 @@ def _compute_sku_metrics(
         m["item_lead_time_days"] > 0, m["product_line_lead_time_days"]
     ).replace(0, 30)
 
-    # Runout risk: current inventory runs out before next PO arrives
+    # Runout risk: total supply (inventory + on_order) covers less than 1.5× lead-time demand.
+    # Mirrors the overstock formula: both use supply vs. multiples of lead_time_demand.
     m["days_until_stockout"] = (
         m["inventory_sy"] / m["avg_daily_sales_sy"].replace(0, np.nan)
     ).fillna(_INF)
+    _runout_threshold = m["avg_daily_sales_sy"] * m["lead_time_days"] * 1.5
     m["runout_risk"] = (
-        (m["days_until_stockout"] < m["lead_time_days"])
-        & (m["on_order_sy"] == 0)
+        ((m["inventory_sy"] + m["on_order_sy"]) < _runout_threshold)
         & (m["inventory_sy"] > 0)
         & (m["avg_daily_sales_sy"] > 0)
     )
@@ -372,8 +373,12 @@ def _compute_sku_metrics(
     # SKU rating A/B/C/D by orders_count quartile
     m = _assign_ratings(m)
 
-    # Launch dates (passed from compute_all — already updated before this call)
-    m["launch_date"] = m["base_sku"].map(launch_dates)
+    # Launch dates — floor at Aug 5 2025 so displayed date is consistent with
+    # what avg_daily_sales is calculated against (effective_days uses same floor).
+    _FLOOR_DISPLAY = date(2025, 8, 5)
+    m["launch_date"] = m["base_sku"].map(launch_dates).apply(
+        lambda d: max(d, _FLOOR_DISPLAY) if pd.notna(d) and isinstance(d, date) else d
+    )
 
     # Stock-turn targets — resolve once per unique attribute combination
     from app.data.store import get_all_targets as _get_all_targets
