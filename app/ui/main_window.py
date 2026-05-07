@@ -192,8 +192,13 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(200, check)
 
     def _load_data(self) -> None:
-        if self._thread and self._thread.isRunning():
-            return
+        # Guard against the underlying C++ QThread being deleted between refreshes.
+        try:
+            if self._thread is not None and self._thread.isRunning():
+                return
+        except RuntimeError:
+            self._thread = None
+            self._worker = None
 
         self._btn_refresh.setEnabled(False)
         self._btn_refresh.setText("Loading…")
@@ -214,7 +219,14 @@ class MainWindow(QMainWindow):
         self._worker.error.connect(self._thread.quit)
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._on_thread_finished)
         self._thread.start()
+
+    def _on_thread_finished(self) -> None:
+        # Drop Python refs once Qt has scheduled the C++ objects for deletion,
+        # so the next _load_data() doesn't poke a dangling QThread.
+        self._thread = None
+        self._worker = None
 
     def _on_data_ready(self, bundle: DatasetBundle) -> None:
         self._bundle = bundle
