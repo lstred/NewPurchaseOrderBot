@@ -71,6 +71,7 @@ _TABLE_COLS: list[str] = [
     "Rating",
     "Runout Risk",
     "Overstock",
+    "Backorders",
 ]
 
 _TABLE_ID = "daily_pos"
@@ -117,9 +118,9 @@ def _build_row(row: pd.Series, metrics_map: dict) -> list:
 
     lt = int(row.get("lead_time_days", 30))
 
-    runout = m.get("runout_risk", False) if m else False
-
-    overstock = m.get("overstock_flag", False) if m else False
+    runout        = m.get("runout_risk",    False) if m else False
+    overstock     = m.get("overstock_flag",  False) if m else False
+    backorder_ct  = int(m.get("backorder_count", 0)) if m else 0
 
     return [
         str(row.get("order_number", "")),
@@ -140,8 +141,9 @@ def _build_row(row: pd.Series, metrics_map: dict) -> list:
         f"{avg_daily:.3f}"                                        if m else "—",
         (f"{doi:.0f}d" if doi < _INF else "∞")                   if m else "—",
         str(m.get("sku_rating", "—"))                             if m else "—",
-        ("Yes" if runout else "No")                               if m else "—",
+        ("Yes" if runout    else "No")                            if m else "—",
         ("Yes" if overstock else "No")                            if m else "—",
+        str(backorder_ct)                                         if m else "—",
     ]
 
 
@@ -378,6 +380,7 @@ class DailyPOsTab(QWidget):
         self._sections: list[_OperatorSection] = []
         self._thread: Optional[QThread]  = None
         self._worker: Optional[_LoadWorker] = None
+        self._syncing_column_width: bool = False
         self._build_ui()
 
     # ── Public API ──────────────────────────────────────────────────────
@@ -589,6 +592,12 @@ class DailyPOsTab(QWidget):
             for col, vis in prefs.items():
                 section.apply_column_prefs({col: vis})
             section.table.restore_column_widths()
+            # Sync resize events to all other operator tables
+            _hdr = section.table.horizontalHeader()
+            _hdr.sectionResized.connect(
+                lambda col, _old, new, _t=section.table:
+                self._sync_column_width(_t, col, new)
+            )
             section.row_double_clicked.connect(self._on_sku_double_click)
 
             rows = [_build_row(r, metrics_map) for _, r in op_df.iterrows()]
@@ -614,6 +623,18 @@ class DailyPOsTab(QWidget):
         )
 
     # ── Signal handlers ──────────────────────────────────────────────────
+
+    def _sync_column_width(self, source_table: DataTable, col_idx: int, new_size: int) -> None:
+        """Propagate a column-resize from one operator table to all others."""
+        if self._syncing_column_width:
+            return
+        self._syncing_column_width = True
+        try:
+            for sec in self._sections:
+                if sec.table is not source_table:
+                    sec.table.setColumnWidth(col_idx, new_size)
+        finally:
+            self._syncing_column_width = False
 
     def _on_sku_double_click(self, sku: str) -> None:
         if not sku or self._bundle is None:
