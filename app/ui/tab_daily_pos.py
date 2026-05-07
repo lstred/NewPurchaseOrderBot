@@ -71,7 +71,7 @@ _TABLE_COLS: list[str] = [
     "Rating",
     "Runout Risk",
     "Overstock",
-    "Backorders",
+    "Backorders (SY)",
 ]
 
 _TABLE_ID = "daily_pos"
@@ -120,7 +120,7 @@ def _build_row(row: pd.Series, metrics_map: dict) -> list:
 
     runout        = m.get("runout_risk",    False) if m else False
     overstock     = m.get("overstock_flag",  False) if m else False
-    backorder_ct  = int(m.get("backorder_count", 0)) if m else 0
+    bo_qty_sy     = float(m.get("strict_bo_qty_sy", 0)) if m else 0.0
 
     return [
         str(row.get("order_number", "")),
@@ -143,7 +143,7 @@ def _build_row(row: pd.Series, metrics_map: dict) -> list:
         str(m.get("sku_rating", "—"))                             if m else "—",
         ("Yes" if runout    else "No")                            if m else "—",
         ("Yes" if overstock else "No")                            if m else "—",
-        str(backorder_ct)                                         if m else "—",
+        f"{bo_qty_sy:,.1f}"                                       if m else "—",
     ]
 
 
