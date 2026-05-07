@@ -228,6 +228,18 @@ class MainWindow(QMainWindow):
         self._thread = None
         self._worker = None
 
+    def closeEvent(self, event) -> None:  # noqa: N802 — Qt API
+        # If the user closes the window mid-refresh, wait for the worker
+        # thread to finish before letting Qt tear down — otherwise we get
+        # "QThread: Destroyed while thread is still running" on stderr.
+        try:
+            if self._thread is not None and self._thread.isRunning():
+                self._thread.quit()
+                self._thread.wait(5000)
+        except RuntimeError:
+            pass
+        super().closeEvent(event)
+
     def _on_data_ready(self, bundle: DatasetBundle) -> None:
         self._bundle = bundle
         self._btn_refresh.setEnabled(True)
