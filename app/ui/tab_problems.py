@@ -154,6 +154,8 @@ class AlertCard(QFrame):
 
 
 class ProblemAreasTab(QWidget):
+    sku_selected = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._bundle: Optional[DatasetBundle] = None
@@ -280,6 +282,7 @@ class ProblemAreasTab(QWidget):
     def _on_timeline_requested(self, sku: str) -> None:
         if self._bundle is not None:
             dlg = TimelineDialog(sku, self._bundle, self)
+            dlg.open_in_tab.connect(self.sku_selected)
             dlg.show()
 
     def _apply_filters(self, df: pd.DataFrame, filters: dict) -> pd.DataFrame:

@@ -202,17 +202,21 @@ class TimelineDialog(QDialog):
                     layout.insertWidget(i, self._chart_widget)
                     break
 
-        # PO table — use po_events dict (always correct, no base_sku lookup needed)
+        # PO table — build from open_pos directly so lines without ETA also appear
         po_rows = []
-        for ev in po_events:
-            po_rows.append([
-                ev.get("order_number", ""),
-                str(ev.get("eta_date", "")),
-                f"{ev.get('quantity_sy', 0):,.1f}",
-                ev.get("supplier_number", ""),
-            ])
-        # Sort by ETA date
-        po_rows.sort(key=lambda r: r[1])
+        if not bundle.open_pos.empty and "base_sku" in bundle.open_pos.columns:
+            sku_pos = bundle.open_pos[
+                bundle.open_pos["base_sku"].str.strip() == sku.strip()
+            ]
+            for _, pr in sku_pos.iterrows():
+                eta = pr.get("eta_date")
+                po_rows.append([
+                    str(pr.get("order_number", "")),
+                    str(eta) if pd.notna(eta) else "No ETA",
+                    f"{pr.get('quantity_sy', 0):,.1f}",
+                    str(pr.get("supplier_number", "")),
+                ])
+            po_rows.sort(key=lambda r: r[1])
         self._po_table.populate(po_rows)
 
         # Recommendation

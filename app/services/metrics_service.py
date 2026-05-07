@@ -394,15 +394,22 @@ def _compute_sku_metrics(
     m["is_new"] = m["launch_date"].apply(
         lambda d: (today - d).days < 180 if pd.notna(d) else False
     )
-    target_doi = 365.0 / m["stockturn_target"].replace(0, 4.0)
+    # Overstock: total supply (inventory + on-order) exceeds 3× lead-time demand.
+    # If net_inventory > 3 × (avg_daily × lead_time), we have far more supply than
+    # needed for the next replenishment cycle.
+    _lead_demand_3x = m["avg_daily_sales_sy"] * m["lead_time_days"] * 3
     m["overstock_flag"] = (
-        (m["days_of_inventory"].replace(_INF, np.nan) > target_doi * 2)
+        (m["net_inventory_sy"] > _lead_demand_3x)
+        & (m["avg_daily_sales_sy"] > 0)
         & (m["inventory_sy"] > 0)
         & ~m["is_new"]
     ).fillna(False)
+    # Excess orders: open POs would push total supply above 2.5× lead-time demand
+    _lead_demand_2_5x = m["avg_daily_sales_sy"] * m["lead_time_days"] * 2.5
     m["excess_order_flag"] = (
-        (m["net_inventory_sy"] / m["avg_daily_sales_sy"].replace(0, np.nan) > target_doi * 2.5)
+        (m["net_inventory_sy"] > _lead_demand_2_5x)
         & (m["on_order_sy"] > 0)
+        & (m["avg_daily_sales_sy"] > 0)
         & ~m["is_new"]
     ).fillna(False)
     m["stockout_flag"] = (

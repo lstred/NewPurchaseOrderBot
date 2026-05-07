@@ -244,7 +244,17 @@ class PriceClassDetailDialog(QDialog):
     def _on_double_click(self, row: int, _col: int) -> None:
         item = self._table.item(row, 0)
         if item and self._bundle is not None:
-            dlg = TimelineDialog(item.text(), self._bundle, self)
+            sku = item.text()
+            dlg = TimelineDialog(sku, self._bundle, self)
+
+            def _navigate(nav_sku: str) -> None:
+                dlg.close()
+                self.close()
+                parent_tab = self.parent()
+                if parent_tab is not None and hasattr(parent_tab, "sku_selected"):
+                    parent_tab.sku_selected.emit(nav_sku)
+
+            dlg.open_in_tab.connect(_navigate)
             dlg.show()
 
 

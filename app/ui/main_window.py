@@ -114,6 +114,7 @@ class MainWindow(QMainWindow):
         # Wire signals
         self._overview_tab.sku_selected.connect(self._on_sku_selected)
         self._overview_tab.filters_changed.connect(self._on_filters_changed)
+        self._problems_tab.sku_selected.connect(self._on_sku_selected)
 
     def _build_toolbar(self) -> QFrame:
         bar = QFrame()
