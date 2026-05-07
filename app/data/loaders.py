@@ -201,9 +201,9 @@ def load_rolls(items_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     df["quantity_sy"] = df["quantity_sy"].clip(lower=0)
     df["receive_date"] = pd.to_datetime(df["receive_date"], errors="coerce").dt.date
     today = date.today()
-    df["age_days"] = df["receive_date"].apply(
-        lambda d: (today - d).days if pd.notna(d) else 0
-    )
+    # Vectorised age_days (replaces per-row apply)
+    _rd = pd.to_datetime(df["receive_date"], errors="coerce")
+    df["age_days"] = (pd.Timestamp(today) - _rd).dt.days.fillna(0).astype(int)
     return df
 
 

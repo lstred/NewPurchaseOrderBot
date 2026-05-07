@@ -214,36 +214,63 @@ def _compute_sku_metrics(
     # is not diluted by the full query window.
     _FLOOR = date(2025, 8, 5)
 
-    def _effective_days(sku: str) -> int:
-        """Days the product has been available, floored at Aug 5 2025."""
-        ld = launch_dates.get(str(sku))
-        if ld is None:
-            return days_in_range
-        effective_start = max(ld, _FLOOR)
-        return max((end_date - effective_start).days + 1, 1)
+    # Vectorised effective_days lookup (replaces per-row apply over thousands of SKUs)
+    _today_ts = pd.Timestamp(end_date)
+
+    def _effective_days_series(skus: pd.Series) -> pd.Series:
+        """For each SKU, return days_in_range capped to (end_date - max(launch, FLOOR)) + 1."""
+        # Map SKU → launch date (NaT if missing)
+        ld = skus.map(launch_dates)
+        ld = pd.to_datetime(ld, errors="coerce")
+        floor_ts = pd.Timestamp(_FLOOR)
+        # max(launch, FLOOR); where missing keep NaT
+        eff_start = ld.where(ld.notna(), other=pd.NaT)
+        eff_start = eff_start.where(eff_start >= floor_ts, floor_ts)
+        eff_days = (_today_ts - eff_start).dt.days + 1
+        eff_days = eff_days.fillna(days_in_range).clip(lower=1).astype(int)
+        return eff_days
 
     # --- Sales aggregation ---
     if not orders.empty:
+        # Pre-compute boolean-weighted columns so .agg can use plain "sum" (much
+        # faster than per-group lambdas which iterate every row in Python).
+        _o = orders
+        # Original code used `.count()` on a boolean series filtered by itself,
+        # which counts True values. `.sum()` of a bool column does the same job
+        # at vectorised C speed.
+        _bo_flag     = _o["backorder_flag"].astype(bool)
+        _strict_flag = _o["strict_bo_flag"].astype(bool)
+        _filled_flag = _o["filled_flag"].astype(bool)
+        _qty         = pd.to_numeric(_o["quantity_sy"], errors="coerce").fillna(0.0)
+        _agg_input = pd.DataFrame({
+            "base_sku":         _o["base_sku"],
+            "quantity_sy":      _qty,
+            "order_line_id":    _o["order_line_id"],
+            "_bo_int":          _bo_flag.astype("int64"),
+            "_strict_qty":      _qty * _strict_flag,
+            "_filled_int":      _filled_flag.astype("int64"),
+            "order_entry_date": _o["order_entry_date"],
+        })
         sales_agg = (
-            orders.groupby("base_sku")
+            _agg_input.groupby("base_sku")
             .agg(
                 total_qty_sy=("quantity_sy", "sum"),
                 orders_count=("order_line_id", "nunique"),
-                backorder_count=("backorder_flag", lambda x: x[x].count()),
-                strict_bo_qty_sy=("quantity_sy", lambda x: x[orders.loc[x.index, "strict_bo_flag"]].sum()),
+                backorder_count=("_bo_int", "sum"),
+                strict_bo_qty_sy=("_strict_qty", "sum"),
                 last_order_date=("order_entry_date", "max"),
-                filled_count=("filled_flag", lambda x: x[x].count()),
+                filled_count=("_filled_int", "sum"),
             )
             .reset_index()
         )
-        sales_agg["effective_days"] = sales_agg["base_sku"].apply(_effective_days)
+        sales_agg["effective_days"] = _effective_days_series(sales_agg["base_sku"])
         sales_agg["avg_daily_sales_sy"] = sales_agg["total_qty_sy"] / sales_agg["effective_days"]
         sales_agg["fill_rate"] = (
             sales_agg["filled_count"] / sales_agg["orders_count"].clip(lower=1)
         ).clip(0, 1)
-        sales_agg["days_since_last_sale"] = sales_agg["last_order_date"].apply(
-            lambda d: (today - d).days if pd.notna(d) else None
-        )
+        # Vectorised days_since_last_sale (replaces per-row apply)
+        _last = pd.to_datetime(sales_agg["last_order_date"], errors="coerce")
+        sales_agg["days_since_last_sale"] = (_today_ts - _last).dt.days
     else:
         sales_agg = pd.DataFrame(
             columns=[
@@ -376,29 +403,43 @@ def _compute_sku_metrics(
     # Launch dates — floor at Aug 5 2025 so displayed date is consistent with
     # what avg_daily_sales is calculated against (effective_days uses same floor).
     _FLOOR_DISPLAY = date(2025, 8, 5)
-    m["launch_date"] = m["base_sku"].map(launch_dates).apply(
-        lambda d: max(d, _FLOOR_DISPLAY) if pd.notna(d) and isinstance(d, date) else d
-    )
+    _ld_series = pd.to_datetime(m["base_sku"].map(launch_dates), errors="coerce")
+    _floor_ts = pd.Timestamp(_FLOOR_DISPLAY)
+    _ld_floored = _ld_series.where(_ld_series >= _floor_ts, _floor_ts)
+    # Convert back to python date objects (preserves NaT → NaT → will be NaT in m)
+    m["launch_date"] = _ld_floored.dt.date.where(_ld_series.notna(), None)
 
-    # Stock-turn targets — resolve once per unique attribute combination
+    # Stock-turn targets — vectorised resolution.  Original code used df.apply(axis=1)
+    # which loops in Python over every SKU.  Here we layer overrides from least
+    # specific (sup) up to most specific (sku); later .where() keeps higher
+    # precedence values, exactly mirroring resolve_target() precedence.
     from app.data.store import get_all_targets as _get_all_targets
     _all_targets = _get_all_targets()  # single disk read
-    m["stockturn_target"] = m.apply(
-        lambda row: resolve_target(
-            cost_center=str(row.get("cost_center", "")),
-            price_class=str(row.get("price_class", "")),
-            product_line=str(row.get("product_line", "")),
-            supplier=str(row.get("supplier_number", "")),
-            sku=str(row.get("base_sku", "")),
-            _targets_cache=_all_targets,
-        )[0],
-        axis=1,
-    )
+    _global_target = float(_all_targets.get("global", 4.0))
 
-    # Alert flags
-    m["is_new"] = m["launch_date"].apply(
-        lambda d: (today - d).days < 180 if pd.notna(d) else False
-    )
+    def _scoped_map(prefix: str) -> dict[str, float]:
+        return {k[len(prefix):]: float(v) for k, v in _all_targets.items()
+                if k.startswith(prefix)}
+
+    targets = pd.Series(_global_target, index=m.index, dtype="float64")
+    for col, prefix in [
+        ("supplier_number", "sup:"),
+        ("product_line",    "pl:"),
+        ("price_class",     "pc:"),
+        ("cost_center",     "cc:"),
+        ("base_sku",        "sku:"),
+    ]:
+        sub = _scoped_map(prefix)
+        if not sub or col not in m.columns:
+            continue
+        overrides = m[col].astype(str).map(sub)
+        targets = overrides.where(overrides.notna(), targets)
+    m["stockturn_target"] = targets
+
+    # Alert flags — vectorised is_new check
+    _ld_for_new = pd.to_datetime(m["launch_date"], errors="coerce")
+    m["is_new"] = ((_today_ts - _ld_for_new).dt.days < 180).fillna(False)
+
     # Overstock: project inventory AFTER the next on-order PO arrives.
     # Before the PO lands, avg_daily × lead_time worth of stock will have sold.
     # projected_post_receipt = max(inventory - daily×lead_time, 0) + on_order
