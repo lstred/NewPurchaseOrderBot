@@ -415,7 +415,7 @@ class ProblemAreasTab(QWidget):
 
         for atype, (label, color_key, icon, _) in _ALERT_TYPES.items():
             pill = _FilterPill(atype, label, color_key, icon)
-            pill.toggled.connect(self._refresh_view)
+            pill.toggled.connect(self._schedule_refresh)
             self._pills[atype] = pill
             pl.addWidget(pill)
 
