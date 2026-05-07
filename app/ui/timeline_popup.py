@@ -302,15 +302,22 @@ def _build_fig(sku: str, df: pd.DataFrame, po_events: list):
             ),
         ))
 
-        # Add a vertical dashed line for each receipt date
+        # Add a vertical dashed line + annotation for each receipt date
         for d, qty in receipt_totals.items():
+            x_str = str(d)
             fig.add_vline(
-                x=str(d),
+                x=x_str,
                 line=dict(color=c["success"], width=1.5, dash="dot"),
-                annotation_text=f"+{qty:,.0f} SY",
-                annotation_position="top",
-                annotation_font=dict(color=c["success"], size=11),
-                annotation_bgcolor="rgba(0,0,0,0)",
+            )
+            fig.add_annotation(
+                x=x_str,
+                y=1,
+                yref="paper",
+                text=f"+{qty:,.0f} SY",
+                showarrow=False,
+                yanchor="bottom",
+                font=dict(color=c["success"], size=11),
+                bgcolor="rgba(0,0,0,0)",
             )
 
     fig.update_layout(
