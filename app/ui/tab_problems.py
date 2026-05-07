@@ -16,7 +16,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 import pandas as pd
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -338,11 +338,21 @@ class _FilterPill(QPushButton):
 class ProblemAreasTab(QWidget):
     sku_selected = pyqtSignal(str)
 
+    # Maximum cards rendered per pagination batch.  Anything above this would
+    # cause the UI to freeze for several seconds on large datasets.
+    _PAGE_SIZE = 100
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._bundle: Optional[DatasetBundle] = None
         self._last_filters: dict = {}
         self._pills: dict[str, _FilterPill] = {}
+        self._alerts: dict[str, list[pd.Series]] = {}   # cached after _build_alerts()
+        self._visible_count: int = 0                    # how many cards rendered so far
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(120)            # debounce filter/pill toggles
+        self._refresh_timer.timeout.connect(self._do_refresh)
         self._build_ui()
 
     # ── UI construction ────────────────────────────────────────────────
@@ -446,20 +456,24 @@ class ProblemAreasTab(QWidget):
         self._bundle = bundle
         if bundle.filter_values is not None and not bundle.filter_values.empty:
             self._sidebar.populate(bundle.filter_values)
-        self._refresh_view()
+        self._schedule_refresh()
 
-    # ── Internal ───────────────────────────────────────────────────────
+    # ── Internal ───────────────────────────────────
+
+    def _schedule_refresh(self) -> None:
+        """Debounced trigger — collapses bursts of toggles into one rebuild."""
+        self._refresh_timer.start()
 
     def _on_sidebar_filter(self, filters: dict) -> None:
         self._last_filters = filters
-        self._refresh_view()
+        self._schedule_refresh()
 
     def _set_all_pills(self, on: bool) -> None:
         for p in self._pills.values():
             p.blockSignals(True)
             p.setChecked(on)
             p.blockSignals(False)
-        self._refresh_view()
+        self._schedule_refresh()
 
     def _apply_sidebar_filters(self, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
@@ -481,40 +495,75 @@ class ProblemAreasTab(QWidget):
         return df
 
     def _build_alerts(self, df: pd.DataFrame) -> dict[str, list[pd.Series]]:
-        """Return {alert_type: [row, row, ...]} after snooze + new-item exclusion."""
+        """Return {alert_type: [row, row, ...]} after snooze + new-item exclusion.
+
+        Each list is sorted by total_qty_sy (sales volume) DESCENDING so the
+        most impactful items appear at the top.  Vectorised pre-filter for
+        performance — we only iterate rows that actually qualify for an alert.
+        """
         out: dict[str, list[pd.Series]] = {k: [] for k in _ALERT_TYPES}
         if df is None or df.empty:
             return out
 
         today = date.today()
 
-        for _, row in df.iterrows():
-            sku = str(row.get("sku", "")).strip()
-            if not sku:
+        # ---- Pre-compute boolean masks (vectorised) -------------------
+        sku_col       = df["sku"].astype(str).str.strip()
+        launch_col    = df.get("launch_date")
+        po_qty_col    = pd.to_numeric(df.get("on_order_sy", 0), errors="coerce").fillna(0)
+        inv_col       = pd.to_numeric(df.get("inventory_sy", 0), errors="coerce").fillna(0)
+        avg_daily_col = pd.to_numeric(df.get("avg_daily_sales_sy", 0), errors="coerce").fillna(0)
+        bo_qty_col    = pd.to_numeric(df.get("strict_bo_qty_sy", 0), errors="coerce").fillna(0)
+        sales_col     = pd.to_numeric(df.get("total_qty_sy", 0), errors="coerce").fillna(0)
+
+        if launch_col is not None:
+            def _is_new(d):
+                if not pd.notna(d) or not isinstance(d, date):
+                    return False
+                return (today - d).days < 180
+            new_mask = launch_col.apply(_is_new)
+        else:
+            new_mask = pd.Series(False, index=df.index)
+
+        overstock_flag = df.get("overstock_flag", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+        runout_flag    = df.get("runout_risk",    pd.Series(False, index=df.index)).fillna(False).astype(bool)
+
+        # Overstock: only include items that have an open PO OR an active
+        # backorder against them — those are the ones worth acting on now.
+        overstock_mask = (
+            overstock_flag
+            & (~new_mask)
+            & ((po_qty_col > 0) | (bo_qty_col > 0))
+        )
+        runout_mask    = runout_flag
+        nostock_mask   = (
+            (inv_col <= 0)
+            & (po_qty_col <= 0)
+            & (avg_daily_col > 0)
+            & (~new_mask)
+        )
+
+        masks: dict[str, pd.Series] = {
+            "overstock":   overstock_mask,
+            "runout_risk": runout_mask,
+            "no_stock":    nostock_mask,
+        }
+
+        for atype, mask in masks.items():
+            if not mask.any():
                 continue
-            launch = row.get("launch_date")
-            is_new = (
-                pd.notna(launch) and isinstance(launch, date)
-                and (today - launch).days < 180
-            )
-            po_qty = float(row.get("on_order_sy", 0) or 0)
-            inv = float(row.get("inventory_sy", 0) or 0)
-            avg_daily = float(row.get("avg_daily_sales_sy", 0) or 0)
-
-            # Overstock (skip new items)
-            if not is_new and bool(row.get("overstock_flag", False)):
-                if not is_snoozed(f"overstock:{sku}", po_qty):
-                    out["overstock"].append(row)
-
-            # Runout risk
-            if bool(row.get("runout_risk", False)):
-                if not is_snoozed(f"runout_risk:{sku}", po_qty):
-                    out["runout_risk"].append(row)
-
-            # Zero stock & no PO
-            if (inv <= 0) and (po_qty <= 0) and (avg_daily > 0) and not is_new:
-                if not is_snoozed(f"no_stock:{sku}", po_qty):
-                    out["no_stock"].append(row)
+            sub = df.loc[mask].copy()
+            # Sort by sales DESC so highest-impact items appear first.
+            sub["_sales_for_sort"] = sales_col.loc[mask].values
+            sub = sub.sort_values("_sales_for_sort", ascending=False)
+            for _, row in sub.iterrows():
+                sku = str(row.get("sku", "")).strip()
+                if not sku:
+                    continue
+                po_qty = float(row.get("on_order_sy", 0) or 0)
+                if is_snoozed(f"{atype}:{sku}", po_qty):
+                    continue
+                out[atype].append(row)
 
         return out
 
@@ -526,50 +575,93 @@ class ProblemAreasTab(QWidget):
             if w is not None:
                 w.deleteLater()
 
-    def _refresh_view(self) -> None:
+    def _do_refresh(self) -> None:
+        """Full rebuild of alert list — always renders the first PAGE_SIZE cards."""
         if self._bundle is None:
             return
         df = self._apply_sidebar_filters(self._bundle.sku_metrics)
-        alerts = self._build_alerts(df)
+        self._alerts = self._build_alerts(df)
 
-        # Update pill counts
+        # Update pill counts (shows TOTAL matched, not just rendered)
         for atype, pill in self._pills.items():
-            pill.set_count(len(alerts.get(atype, [])))
+            pill.set_count(len(self._alerts.get(atype, [])))
 
-        # Build the visible list, ordered: runout_risk → no_stock → overstock
-        self._clear_alerts()
+        self._visible_count = 0
+        self._render_cards(reset=True)
 
+    def _render_cards(self, reset: bool) -> None:
+        """Render the next batch of alert cards (or rebuild from scratch)."""
         order = ["runout_risk", "no_stock", "overstock"]
-        total_visible = 0
+        # Build a flat ordered list of (atype, row) pairs, respecting pill toggles
+        flat: list[tuple[str, pd.Series]] = []
         for atype in order:
             if not self._pills[atype].isChecked():
                 continue
-            for row in alerts[atype]:
+            for row in self._alerts.get(atype, []):
+                flat.append((atype, row))
+
+        total_matching = len(flat)
+
+        # Repaint: throttle UI updates while we manipulate widgets
+        self._alert_container.setUpdatesEnabled(False)
+        try:
+            if reset:
+                self._clear_alerts()
+                self._visible_count = 0
+
+            # Render up to PAGE_SIZE more cards from the flat list
+            new_target = min(self._visible_count + self._PAGE_SIZE, total_matching)
+            for atype, row in flat[self._visible_count:new_target]:
                 card = AlertCard(atype, row, self._alert_container)
                 card.snoozed.connect(self._on_card_snoozed)
                 card.timeline_requested.connect(self._on_timeline_requested)
                 self._alert_layout.insertWidget(self._alert_layout.count() - 1, card)
-                total_visible += 1
+            self._visible_count = new_target
 
-        # Empty state
-        if total_visible == 0:
-            empty = QLabel(self._empty_state_text(alerts))
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty.setWordWrap(True)
-            empty.setStyleSheet(
-                f"color: {theme.get('text_muted')}; "
-                f"font-size: 14px; padding: 60px 20px;"
+            # Empty state
+            if total_matching == 0:
+                empty = QLabel(self._empty_state_text(self._alerts))
+                empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                empty.setWordWrap(True)
+                empty.setStyleSheet(
+                    f"color: {theme.get('text_muted')}; "
+                    f"font-size: 14px; padding: 60px 20px;"
+                )
+                self._alert_layout.insertWidget(self._alert_layout.count() - 1, empty)
+            elif self._visible_count < total_matching:
+                # "Load more" footer button
+                more_btn = QPushButton(
+                    f"▼  Show next {min(self._PAGE_SIZE, total_matching - self._visible_count)} "
+                    f"·  ({self._visible_count:,} of {total_matching:,} shown)"
+                )
+                more_btn.setObjectName("flat")
+                more_btn.setMinimumHeight(40)
+                more_btn.clicked.connect(self._on_load_more)
+                self._alert_layout.insertWidget(self._alert_layout.count() - 1, more_btn)
+        finally:
+            self._alert_container.setUpdatesEnabled(True)
+
+        # Header summary
+        total_all = sum(len(v) for v in self._alerts.values())
+        if total_all == total_matching:
+            self._lbl_summary.setText(
+                f"{total_all:,} active alert{'s' if total_all != 1 else ''}"
             )
-            self._alert_layout.insertWidget(self._alert_layout.count() - 1, empty)
-
-        # Summary text in the header
-        total_all = sum(len(v) for v in alerts.values())
-        if total_all == total_visible:
-            self._lbl_summary.setText(f"{total_all:,} active alert{'s' if total_all != 1 else ''}")
         else:
             self._lbl_summary.setText(
-                f"{total_visible:,} of {total_all:,} alerts shown"
+                f"{total_matching:,} of {total_all:,} alerts shown"
             )
+
+    def _on_load_more(self) -> None:
+        # Remove the load-more button (it's right before the trailing stretch)
+        for i in range(self._alert_layout.count() - 2, -1, -1):
+            item = self._alert_layout.itemAt(i)
+            w = item.widget() if item else None
+            if isinstance(w, QPushButton) and w.objectName() == "flat":
+                self._alert_layout.takeAt(i)
+                w.deleteLater()
+                break
+        self._render_cards(reset=False)
 
     def _empty_state_text(self, alerts: dict[str, list]) -> str:
         any_checked = any(p.isChecked() for p in self._pills.values())
@@ -582,7 +674,7 @@ class ProblemAreasTab(QWidget):
     # ── Card signals ──────────────────────────────────────────────────
 
     def _on_card_snoozed(self, _key: str) -> None:
-        self._refresh_view()
+        self._schedule_refresh()
 
     def _on_timeline_requested(self, sku: str) -> None:
         if self._bundle is None or not sku:
