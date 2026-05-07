@@ -236,3 +236,46 @@ def load_pending_pos(items_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
 
 def load_filter_values() -> pd.DataFrame:
     return read_dataframe(FILTER_VALUES_SQL)
+
+
+def load_daily_pos(target_date: date) -> pd.DataFrame:
+    """Load all warehouse PO lines entered on *target_date*, joined with item master.
+
+    The SQL already resolves base_sku via IIXREF and joins ITEM/PRICE/PRODLINE.
+    This loader handles UOM conversion and strips CHAR-column padding.
+    """
+    from app.data.queries import DAILY_POS_SQL  # avoid circular at module level
+
+    date_ymd = int(target_date.strftime("%Y%m%d"))
+    df = read_dataframe(DAILY_POS_SQL, {"date_ymd": date_ymd})
+
+    if df.empty:
+        return df
+
+    # Strip AS/400 CHAR-column padding
+    df["sku"] = df["sku"].str.strip()
+    df["base_sku"] = df["base_sku"].str.strip()
+
+    # Width: prefer the order-level width, fall back to item master width
+    df["item_width_inches"] = df["item_width_inches"].fillna(0).astype(float)
+    df["item_width_master"] = df["item_width_master"].fillna(0).astype(float)
+    df["item_width_inches"] = df["item_width_inches"].where(
+        df["item_width_inches"] > 0, df["item_width_master"]
+    )
+
+    # Cost center string (already in SQL, just ensure clean)
+    df["cost_center"] = df["cost_center"].fillna("").str.strip()
+
+    # UOM → SY conversion
+    df["quantity_sy"] = _vectorised_to_sy(
+        df, "quantity_ordered", "unit_of_measure", "item_width_inches", "cost_center"
+    ).clip(lower=0)
+
+    # Lead time: item-level → product-line default → 30 days fallback
+    df["item_lead_time_days"] = df["item_lead_time_days"].fillna(0).astype(int)
+    df["product_line_lead_time_days"] = df["product_line_lead_time_days"].fillna(0).astype(int)
+    df["lead_time_days"] = df["item_lead_time_days"].where(
+        df["item_lead_time_days"] > 0, df["product_line_lead_time_days"]
+    ).where(lambda s: s > 0, 30)
+
+    return df

@@ -584,8 +584,7 @@ NewPurchBot/
       tab_overview.py        — Overview tab: 6 KPI cards + 21-column SKU table
       tab_timeline.py        — Inventory Timeline: 180-day Plotly projection per SKU
       tab_fillrate.py        — Fill Rate: histogram + per-SKU table
-      tab_problems.py        — Problem Areas: alert cards with snooze + Timeline button
-      tab_settings.py        — Settings: stock-turn targets at all filter levels
+      tab_problems.py        — Problem Areas: alert cards with snooze + Timeline button      tab_daily_pos.py       — Daily POs: per-date PO activity grouped by operator initials      tab_settings.py        — Settings: stock-turn targets at all filter levels
       timeline_popup.py      — Reusable TimelineDialog popup (used from Overview + Problems)
       overview_dialogs.py    — ColumnManagerDialog + ThresholdRulesDialog for Overview table
       __init__.py
@@ -666,7 +665,8 @@ All JSON files stored at `%APPDATA%\PurchaseOrderBot\`:
 | `snooze.json` | Snoozed problem alerts | `"{type}:{sku}": {"until": "YYYY-MM-DD", "po_qty_at_snooze": 0.0}` |
 | `launch_dates.json` | Auto-detected earliest sale/receipt date per SKU | `"{sku}": "YYYY-MM-DD"` |
 | `refresh_state.json` | Smart refresh: last-seen sysTableUpdates timestamps + date range | `{"timestamps": {"DW0001F": "...", "ITEM": "..."}, "date_range": "start:end"}` |
-| `column_widths.json` | Per-table column widths in pixels | `{"overview": {"SKU": 80, ...}, "overview_pc": {...}}` |
+| `column_widths.json` | Per-table column widths in pixels | `{"overview": {"SKU": 80, ...}, "overview_pc": {...}, "daily_pos": {...}}` |
+| `operator_names.json` | Operator initials → full name mapping for Daily POs tab | `{"ABC": "Alice Brown", "JD": "John Doe"}` |
 
 ---
 
@@ -757,6 +757,10 @@ All 11 tables confirmed live with data:
 | "Open in Timeline Tab" does nothing from PC detail dialog | `tab_overview.py` | `open_in_tab` signal from `TimelineDialog` not connected in `PriceClassDetailDialog._on_double_click` | Added `_navigate` closure that closes both dialogs and emits `sku_selected`; also added `sku_selected` signal to `ProblemAreasTab` + wired in `main_window.py` |
 | PO table always empty (root cause) | `timeline_popup.py` | `populate()` called inside `__init__` before `show()` — WebEngine `insertWidget` triggers layout recalculation that collapses the table before rows are painted | Deferred populate via `QTimer.singleShot(80, ...)` so it runs after dialog is fully shown and layout is stable; uses `bundle.po_events` (same source as chart markers) |
 | Overstock definition wrong | `metrics_service.py`, `timeline_popup.py`, `tab_timeline.py` | Old: DOI > 2× target DOI. Didn't account for inventory sold before on-order arrives | New: `projected_post_receipt = max(inv - daily×lead_time, 0) + on_order`; flag overstock when `projected_post_receipt > 3 × daily × lead_time`; recommendation text updated accordingly |
+| Launch date display capped at Aug 5, 2025 | `metrics_service.py` | `m["launch_date"]` stored raw uncapped dates (e.g. 2024-05-22) even though `_effective_days()` already floored calculations at Aug 5 2025 | Applied `max(d, _FLOOR_DISPLAY)` to the displayed launch_date column so UI is consistent with what avg_daily is calculated against |
+| Runout risk redefined | `metrics_service.py` | Old: `inventory < lead_time_demand AND on_order == 0`. Too narrow — missed cases with a PO on order that still can't cover demand | New: `(inventory + on_order) < 1.5 × avg_daily × lead_time`. Mirrors overstock formula; no longer requires on_order == 0 |
+| Monthly sales bar chart | `timeline_popup.py`, `tab_timeline.py` | Users wanted to see last-12-months bar chart in both popup and Timeline tab | Added `_build_monthly_chart(sku, bundle)` helper in `timeline_popup.py` (imported by `tab_timeline.py`); groupby on pre-loaded `bundle.orders` — no extra SQL; 200px-tall chart placed after PO table in both views |
+| Daily POs tab | `tab_daily_pos.py`, `queries.py`, `loaders.py`, `store.py`, `main_window.py` | Users wanted to see POs placed on any given day, grouped by operator | New tab "📋 Daily POs": date picker (defaults today), Load button, collapsible per-operator sections, SKU-level DataTable with same column-manager + color-rules as Overview, double-click → TimelineDialog; operator initials → full name mapping stored in `operator_names.json` |
 
 ---
 

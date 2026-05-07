@@ -271,3 +271,21 @@ def set_column_widths(table_id: str, widths: dict[str, int]) -> None:
     data = _load(_COLUMN_WIDTHS_FILE)
     data[table_id] = {k: int(v) for k, v in widths.items()}
     _save(_COLUMN_WIDTHS_FILE, data)
+
+
+# ---------------------------------------------------------------------------
+# Operator name mappings
+# Key: initials (upper-case)   Value: full name
+# ---------------------------------------------------------------------------
+
+_OPERATOR_NAMES_FILE = APPDATA_DIR / "operator_names.json"
+
+
+def get_operator_names() -> dict[str, str]:
+    """Return {initials: full_name}."""
+    return {k: str(v) for k, v in _load(_OPERATOR_NAMES_FILE).items()}
+
+
+def save_all_operator_names(names: dict[str, str]) -> None:
+    """Overwrite the entire operator-name mapping."""
+    _save(_OPERATOR_NAMES_FILE, {k.upper().strip(): v.strip() for k, v in names.items() if k.strip()})

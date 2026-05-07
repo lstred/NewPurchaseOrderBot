@@ -140,3 +140,46 @@ WHERE i.IINVEN = 'Y'
 # Validate connection
 # ---------------------------------------------------------------------------
 PING_SQL = "SELECT 1 AS ping"
+
+# ---------------------------------------------------------------------------
+# Daily purchase orders — warehouse POs entered on a specific date,
+# grouped by operator.  Used by the Daily POs tab.
+# ---------------------------------------------------------------------------
+DAILY_POS_SQL = """
+SELECT
+    LTRIM(RTRIM(CAST(o.[ORDER#]    AS VARCHAR))) AS order_number,
+    LTRIM(RTRIM(CAST(o.[LINE#I]   AS VARCHAR))) AS line_number,
+    o.[ITEM_MFGR_COLOR_PAT]                     AS sku,
+    LTRIM(RTRIM(COALESCE(o.OPERATOR_INITIALS, ''))) AS operator_initials,
+    o.[QUANTITY_ORDERED]                         AS quantity_ordered,
+    LTRIM(RTRIM(o.[UNIT_OF_MEASURE]))            AS unit_of_measure,
+    COALESCE(o.[ITEM_WIDTH_INCHES_IF_R], 0)      AS item_width_inches,
+    o.[PO_ETA_DATE]                              AS eta_date,
+    LTRIM(RTRIM(CAST(o.[SUPPLIER#] AS VARCHAR))) AS supplier_number,
+    COALESCE(o.[ENTENDED_PRICE_NO_FUNDS], 0)     AS extended_price,
+    COALESCE(o.[COST_PER_UM], 0)                 AS cost_per_um,
+    LTRIM(RTRIM(i.ICCTR))                        AS cost_center,
+    LTRIM(RTRIM(i.IPRCCD))                       AS price_class,
+    COALESCE(p.[$DESC], '')                      AS price_class_desc,
+    LTRIM(RTRIM(COALESCE(i.INAME, '')))          AS sku_description,
+    CAST(COALESCE(NULLIF(i.IDELIV, 0), 0) AS INT) AS item_lead_time_days,
+    COALESCE(CAST(NULLIF(pl.LDELIV, 0) AS INT), 0) AS product_line_lead_time_days,
+    COALESCE(CAST(i.IWIDTH AS FLOAT), 0)         AS item_width_master,
+    COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)), ''), i.ItemNumber) AS base_sku
+FROM dbo._ORDERS o
+JOIN dbo.ITEM i
+    ON o.[ITEM_MFGR_COLOR_PAT] = i.ItemNumber
+LEFT JOIN dbo.PRICE p
+    ON LTRIM(RTRIM(p.[$PRCCD])) = LTRIM(RTRIM(i.IPRCCD))
+   AND LTRIM(RTRIM(p.[$LIST#])) = 'LP'
+LEFT JOIN dbo.PRODLINE pl
+    ON LTRIM(RTRIM(pl.[LPROD#])) = LTRIM(RTRIM(i.IPRODL))
+   AND LTRIM(RTRIM(pl.[LMFGR#])) = LTRIM(RTRIM(i.IMFGR))
+WHERE o.[N_NOT_INVENTORY] = 'Y'
+  AND CAST(o.[ACCOUNT#I] AS INT) = 1
+  AND o.[QUANTITY_ORDERED] > 0
+  AND CAST(o.[ORDER_ENTRY_DATE_YYYYMMDD] AS BIGINT) = :date_ymd
+  AND i.IINVEN = 'Y'
+  AND (i.IDISCD IS NULL OR LEN(LTRIM(RTRIM(CAST(i.IDISCD AS VARCHAR)))) < 2)
+  AND LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'
+"""

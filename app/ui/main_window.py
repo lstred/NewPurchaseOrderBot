@@ -21,6 +21,7 @@ from app.ui.tab_timeline import TimelineTab
 from app.ui.tab_fillrate import FillRateTab
 from app.ui.tab_problems import ProblemAreasTab
 from app.ui.tab_settings import SettingsTab
+from app.ui.tab_daily_pos import DailyPOsTab
 from app.data.db import validate_connection
 import app.ui.theme as theme
 
@@ -92,13 +93,15 @@ class MainWindow(QMainWindow):
         self._timeline_tab = TimelineTab()
         self._fillrate_tab = FillRateTab()
         self._problems_tab = ProblemAreasTab()
+        self._daily_pos_tab = DailyPOsTab()
         self._settings_tab = SettingsTab()
 
-        self._tabs.addTab(self._overview_tab, "📊  Overview")
-        self._tabs.addTab(self._timeline_tab, "📈  Inventory Timeline")
-        self._tabs.addTab(self._fillrate_tab, "✅  Fill Rate")
-        self._tabs.addTab(self._problems_tab, "⚠  Problem Areas")
-        self._tabs.addTab(self._settings_tab, "⚙  Settings")
+        self._tabs.addTab(self._overview_tab,   "📊  Overview")
+        self._tabs.addTab(self._timeline_tab,   "📈  Inventory Timeline")
+        self._tabs.addTab(self._fillrate_tab,   "✅  Fill Rate")
+        self._tabs.addTab(self._problems_tab,   "⚠  Problem Areas")
+        self._tabs.addTab(self._daily_pos_tab,  "📋  Daily POs")
+        self._tabs.addTab(self._settings_tab,   "⚙  Settings")
 
         main_layout.addWidget(self._tabs)
 
@@ -115,6 +118,7 @@ class MainWindow(QMainWindow):
         self._overview_tab.sku_selected.connect(self._on_sku_selected)
         self._overview_tab.filters_changed.connect(self._on_filters_changed)
         self._problems_tab.sku_selected.connect(self._on_sku_selected)
+        self._daily_pos_tab.sku_selected.connect(self._on_sku_selected)
 
     def _build_toolbar(self) -> QFrame:
         bar = QFrame()
@@ -228,6 +232,7 @@ class MainWindow(QMainWindow):
         self._timeline_tab.refresh(bundle)
         self._fillrate_tab.refresh(bundle)
         self._problems_tab.refresh(bundle)
+        self._daily_pos_tab.refresh(bundle)
         self._settings_tab.refresh(bundle.filter_values)
 
         sm = bundle.summary
