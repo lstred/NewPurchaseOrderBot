@@ -86,6 +86,36 @@ class NumericTableWidgetItem(QTableWidgetItem):
 
 
 # ---------------------------------------------------------------------------
+# Multi-condition rule evaluation helpers
+# ---------------------------------------------------------------------------
+
+def _eval_single_condition(row_data: list, column_names: list[str], cond: dict) -> bool:
+    """Evaluate one {column, op, value} condition against a table row."""
+    col = cond.get("column", "")
+    try:
+        idx = column_names.index(col)
+    except ValueError:
+        return False
+    if idx >= len(row_data):
+        return False
+    cell_val = str(row_data[idx]) if row_data[idx] is not None else ""
+    return _rule_matches(cell_val, cond.get("op", ">"), str(cond.get("value", "")))
+
+
+def _eval_rule(row_data: list, column_names: list[str], rule: dict) -> bool:
+    """Return True if ALL conditions in the rule match the given row.
+
+    Supports new format (``rule["conditions"]`` list) and legacy flat
+    format (``rule["column"]`` / ``rule["op"]`` / ``rule["value"]``).
+    """
+    conditions = rule.get("conditions")
+    if conditions:
+        return all(_eval_single_condition(row_data, column_names, c) for c in conditions)
+    # Legacy single-condition format
+    return _eval_single_condition(row_data, column_names, rule)
+
+
+# ---------------------------------------------------------------------------
 # KPI card
 # ---------------------------------------------------------------------------
 
@@ -234,39 +264,42 @@ class DataTable(QTableWidget):
             cell_overrides: dict[int, tuple[str | None, str | None]] = {}
 
             for rule in self._rules:
-                eval_col = rule.get("column", "")
-                try:
-                    eval_idx = self._column_names.index(eval_col)
-                except ValueError:
+                if not _eval_rule(row_data, self._column_names, rule):
                     continue
-                if eval_idx >= len(row_data):
-                    continue
-                cell_val = str(row_data[eval_idx]) if row_data[eval_idx] is not None else ""
-                if _rule_matches(cell_val, rule.get("op", ">"), str(rule.get("value", ""))):
-                    bg = rule.get("bg_color") or None
-                    fg = rule.get("fg_color") or None
-                    # Auto-contrast: if bg is set but fg is empty, pick readable text color
-                    if bg and not fg:
-                        fg = _contrasting_color(bg)
-                    if rule.get("target") == "row":
-                        row_bg, row_fg = bg, fg
+
+                bg = rule.get("bg_color") or None
+                fg = rule.get("fg_color") or None
+                # Auto-contrast: if bg set but fg empty, pick readable text color
+                if bg and not fg:
+                    fg = _contrasting_color(bg)
+
+                if rule.get("target") == "row":
+                    row_bg, row_fg = bg, fg
+                else:
+                    apply_col = rule.get("apply_column", "")
+                    if apply_col:
+                        try:
+                            apply_idx = self._column_names.index(apply_col)
+                        except ValueError:
+                            apply_idx = -1
                     else:
-                        # Apply highlight to a specific column (may differ from evaluated column)
-                        apply_col = rule.get("apply_column", "")
-                        if apply_col:
-                            try:
-                                apply_idx = self._column_names.index(apply_col)
-                            except ValueError:
-                                apply_idx = eval_idx
-                        else:
-                            apply_idx = eval_idx
+                        # Default: first condition's column (or legacy "column" key)
+                        conditions = rule.get("conditions")
+                        ref_col = (
+                            conditions[0].get("column", "") if conditions
+                            else rule.get("column", "")
+                        )
+                        try:
+                            apply_idx = self._column_names.index(ref_col)
+                        except ValueError:
+                            apply_idx = -1
+                    if apply_idx >= 0:
                         cell_overrides[apply_idx] = (bg, fg)
 
             for c, val in enumerate(row_data):
                 item = NumericTableWidgetItem(str(val) if val is not None else "")
                 item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
 
-                # Determine effective colors for this cell
                 if c in cell_overrides:
                     bg, fg = cell_overrides[c]
                 else:

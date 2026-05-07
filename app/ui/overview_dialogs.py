@@ -2,14 +2,15 @@
 Dialogs for the Overview tab:
   - ColumnManagerDialog   — show/hide table columns
   - ThresholdRulesDialog  — manage color-threshold rules list
-  - AddEditRuleDialog     — create or edit a single rule
+  - AddEditRuleDialog     — create or edit a single rule (supports multi-condition AND logic)
+  - _ConditionRow         — one condition row widget inside AddEditRuleDialog
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -117,7 +118,7 @@ class ColumnManagerDialog(QDialog):
 class ThresholdRulesDialog(QDialog):
     """Manage the full list of color-threshold rules for the overview table."""
 
-    _HEADERS = ["Column", "Operator", "Value", "Apply to", "Background", "Text Color"]
+    _HEADERS = ["Conditions", "Apply to", "Background", "Text Color"]
 
     def __init__(self, columns: list[str], rules: list[dict], parent=None):
         super().__init__(parent)
@@ -131,8 +132,9 @@ class ThresholdRulesDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
 
         hint = QLabel(
-            "Highlight rows or cells when a column value meets a condition. "
-            "Rules are applied top-to-bottom; later rules override earlier ones for the same row."
+            "Highlight rows or cells when conditions are met. "
+            "Each rule can have multiple conditions — all must match simultaneously. "
+            "Rules are applied top-to-bottom; later rules override earlier ones."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {theme.get('text_muted')}; font-size: 12px;")
@@ -174,34 +176,45 @@ class ThresholdRulesDialog(QDialog):
         for rule in self._rules:
             r = self._rule_table.rowCount()
             self._rule_table.insertRow(r)
-            self._rule_table.setItem(r, 0, QTableWidgetItem(rule.get("column", "")))
-            self._rule_table.setItem(r, 1, QTableWidgetItem(rule.get("op", "")))
-            self._rule_table.setItem(r, 2, QTableWidgetItem(str(rule.get("value", ""))))
 
-            # "Apply to" shows row/cell plus the target column when cross-column is used
+            # Conditions summary — supports new {conditions:[...]} and legacy flat format
+            conditions = rule.get("conditions") or [
+                {
+                    "column": rule.get("column", ""),
+                    "op":     rule.get("op", ""),
+                    "value":  str(rule.get("value", "")),
+                }
+            ]
+            cond_str = "  AND  ".join(
+                f"{c.get('column', '')} {c.get('op', '')} {c.get('value', '')}"
+                for c in conditions
+            )
+            self._rule_table.setItem(r, 0, QTableWidgetItem(cond_str))
+
+            # Apply-to column
             target = rule.get("target", "row").lower()
             apply_col = rule.get("apply_column", "")
             if target == "cell" and apply_col:
-                target_str = f"Cell → {apply_col}"
+                target_str = f"Cell \u2192 {apply_col}"
             else:
                 target_str = target.title()
-            self._rule_table.setItem(r, 3, QTableWidgetItem(target_str))
+            self._rule_table.setItem(r, 1, QTableWidgetItem(target_str))
 
             bg = rule.get("bg_color", "")
             fg = rule.get("fg_color", "")
 
-            bg_item = QTableWidgetItem(bg or "—")
+            bg_item = QTableWidgetItem(bg or "\u2014")
             if bg:
                 bg_item.setBackground(QColor(bg))
                 bg_item.setForeground(QColor("#ffffff" if _is_dark(bg) else "#000000"))
 
-            fg_item = QTableWidgetItem(fg or "—")
+            fg_item = QTableWidgetItem(fg or "\u2014")
             if fg:
                 fg_item.setBackground(QColor(fg))
                 fg_item.setForeground(QColor("#ffffff" if _is_dark(fg) else "#000000"))
 
-            self._rule_table.setItem(r, 4, bg_item)
-            self._rule_table.setItem(r, 5, fg_item)
+            self._rule_table.setItem(r, 2, bg_item)
+            self._rule_table.setItem(r, 3, fg_item)
 
     def _add_rule(self) -> None:
         dlg = AddEditRuleDialog(self._columns, None, self)
@@ -229,59 +242,129 @@ class ThresholdRulesDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Single condition row widget
+# ---------------------------------------------------------------------------
+
+class _ConditionRow(QWidget):
+    """One condition row: [Column ▼] [Operator ▼] [Value ──────────] [×]"""
+
+    removed = pyqtSignal(object)   # emits self
+    _OPS = [">"  , ">=", "<", "<=", "=", "!=", "contains"]
+
+    def __init__(self, columns: list[str], cond: dict | None = None, parent=None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 2, 0, 2)
+        row.setSpacing(6)
+
+        self._col_combo = QComboBox()
+        self._col_combo.addItems(columns)
+        self._col_combo.setMinimumWidth(150)
+        if cond and cond.get("column") in columns:
+            self._col_combo.setCurrentText(cond["column"])
+        row.addWidget(self._col_combo)
+
+        self._op_combo = QComboBox()
+        self._op_combo.addItems(self._OPS)
+        self._op_combo.setFixedWidth(80)
+        if cond and cond.get("op") in self._OPS:
+            self._op_combo.setCurrentText(cond["op"])
+        row.addWidget(self._op_combo)
+
+        self._val_edit = QLineEdit(str(cond["value"]) if cond and "value" in cond else "")
+        self._val_edit.setPlaceholderText("value…")
+        row.addWidget(self._val_edit, 1)   # stretches to fill remaining space
+
+        btn_rm = QPushButton("×")
+        btn_rm.setObjectName("flat")
+        btn_rm.setFixedSize(26, 26)
+        btn_rm.setToolTip("Remove this condition")
+        btn_rm.clicked.connect(lambda: self.removed.emit(self))
+        row.addWidget(btn_rm)
+
+    def get_condition(self) -> dict:
+        return {
+            "column": self._col_combo.currentText(),
+            "op":     self._op_combo.currentText(),
+            "value":  self._val_edit.text().strip(),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Single-rule add / edit dialog
 # ---------------------------------------------------------------------------
 
 class AddEditRuleDialog(QDialog):
-    """Create or edit a single color-threshold rule."""
-
-    _OPS = [">", ">=", "<", "<=", "=", "!=", "contains"]
+    """Create or edit a color rule with one or more AND conditions."""
 
     def __init__(self, columns: list[str], rule: Optional[dict], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add Rule" if rule is None else "Edit Rule")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(580)
         self._rule: dict = dict(rule) if rule else {}
         self._bg_color: str = self._rule.get("bg_color", "")
         self._fg_color: str = self._rule.get("fg_color", "")
         self._columns = columns
+        self._condition_rows: list[_ConditionRow] = []
 
-        layout = QFormLayout(self)
-        self._form = layout
-        layout.setSpacing(14)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        root = QVBoxLayout(self)
+        root.setSpacing(14)
+        root.setContentsMargins(24, 20, 24, 20)
 
-        # Evaluate column
-        self._col_combo = QComboBox()
-        self._col_combo.addItems(columns)
-        if self._rule.get("column") in columns:
-            self._col_combo.setCurrentText(self._rule["column"])
-        layout.addRow("Evaluate Column:", self._col_combo)
+        # ── Conditions section ─────────────────────────────────────────────
+        cond_hdr = QLabel("Conditions \u2014 ALL must match simultaneously:")
+        cond_hdr.setStyleSheet(f"font-weight: 600; color: {theme.get('text')};")
+        root.addWidget(cond_hdr)
 
-        # Operator
-        self._op_combo = QComboBox()
-        self._op_combo.addItems(self._OPS)
-        if self._rule.get("op") in self._OPS:
-            self._op_combo.setCurrentText(self._rule["op"])
-        layout.addRow("Operator:", self._op_combo)
+        self._cond_container = QWidget()
+        self._cond_layout = QVBoxLayout(self._cond_container)
+        self._cond_layout.setContentsMargins(0, 0, 0, 0)
+        self._cond_layout.setSpacing(4)
+        root.addWidget(self._cond_container)
 
-        # Value
-        self._val_edit = QLineEdit(str(self._rule.get("value", "")))
-        self._val_edit.setPlaceholderText("e.g. 90  or  Yes  or  No")
-        layout.addRow("Value:", self._val_edit)
+        # Load existing conditions (backwards-compatible with legacy flat format)
+        existing = self._rule.get("conditions") or []
+        if not existing:
+            col = self._rule.get("column", "")
+            if col:
+                existing = [{
+                    "column": col,
+                    "op":     self._rule.get("op", ">"),
+                    "value":  str(self._rule.get("value", "")),
+                }]
+        for cond in existing:
+            self._add_condition_row(cond)
+        if not existing:
+            self._add_condition_row(None)   # start with one blank row
 
-        # Apply to
+        add_btn = QPushButton("\uff0b  Add Condition")
+        add_btn.setObjectName("flat")
+        add_btn.clicked.connect(lambda: self._add_condition_row(None))
+        row_add = QHBoxLayout()
+        row_add.addWidget(add_btn)
+        row_add.addStretch()
+        root.addLayout(row_add)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {theme.get('border')};")
+        root.addWidget(sep)
+
+        # ── Target / highlight settings ────────────────────────────────────
+        form = QFormLayout()
+        form.setSpacing(12)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        root.addLayout(form)
+
         self._target_combo = QComboBox()
         self._target_combo.addItems(["Row", "Cell"])
         if self._rule.get("target") == "cell":
             self._target_combo.setCurrentIndex(1)
-        layout.addRow("Apply to:", self._target_combo)
+        form.addRow("Apply to:", self._target_combo)
 
-        # Apply Column (only visible when target = Cell)
         self._apply_col_lbl = QLabel("Highlight Column:")
         self._apply_col_combo = QComboBox()
-        self._apply_col_combo.addItem("— (same as evaluate column)", "")
+        self._apply_col_combo.addItem("\u2014 (auto: 1st condition\u2019s column)", "")
         for c in columns:
             self._apply_col_combo.addItem(c, c)
         existing_apply = self._rule.get("apply_column", "")
@@ -289,34 +372,52 @@ class AddEditRuleDialog(QDialog):
             idx = self._apply_col_combo.findData(existing_apply)
             if idx >= 0:
                 self._apply_col_combo.setCurrentIndex(idx)
-        layout.addRow(self._apply_col_lbl, self._apply_col_combo)
+        form.addRow(self._apply_col_lbl, self._apply_col_combo)
 
-        # Background color
         self._bg_preview, bg_widget = self._make_color_row("bg")
-        layout.addRow("Background:", bg_widget)
+        form.addRow("Background:", bg_widget)
 
-        # Text color
         self._fg_preview, fg_widget = self._make_color_row("fg")
-        layout.addRow("Text Color:", fg_widget)
+        form.addRow("Text Color:", fg_widget)
 
         hint = QLabel(
-            "Tip: numeric fields compare as numbers; text fields compare as strings.\n"
-            "Use \u2018Highlight Column\u2019 to color a different column based on the evaluated condition."
+            "Tip: numeric fields compare as numbers; text fields compare as strings.  "
+            "All conditions must be true simultaneously to trigger the rule."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {theme.get('text_muted')}; font-size: 11px;")
-        layout.addRow(hint)
+        root.addWidget(hint)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        root.addWidget(buttons)
 
-        # Wire target toggle
         self._target_combo.currentTextChanged.connect(self._on_target_changed)
         self._on_target_changed(self._target_combo.currentText())
+
+    # ------------------------------------------------------------------
+    # Condition row management
+    # ------------------------------------------------------------------
+
+    def _add_condition_row(self, cond: dict | None) -> None:
+        row_widget = _ConditionRow(self._columns, cond, self)
+        row_widget.removed.connect(self._remove_condition_row)
+        self._condition_rows.append(row_widget)
+        self._cond_layout.addWidget(row_widget)
+
+    def _remove_condition_row(self, row: "_ConditionRow") -> None:
+        if len(self._condition_rows) <= 1:
+            return   # always keep at least one condition
+        self._condition_rows.remove(row)
+        self._cond_layout.removeWidget(row)
+        row.deleteLater()
+
+    # ------------------------------------------------------------------
+    # Color pickers
+    # ------------------------------------------------------------------
 
     def _make_color_row(self, which: str) -> tuple[QLabel, QWidget]:
         w = QWidget()
@@ -328,7 +429,7 @@ class AddEditRuleDialog(QDialog):
         preview.setFixedSize(28, 28)
         row.addWidget(preview)
 
-        btn = QPushButton("Choose…")
+        btn = QPushButton("Choose\u2026")
         btn.clicked.connect(lambda: self._pick_color(which))
         row.addWidget(btn)
 
@@ -339,7 +440,7 @@ class AddEditRuleDialog(QDialog):
 
         row.addStretch()
 
-        self._update_preview_widget(which, preview)
+        self._update_preview(which, preview)
         return preview, w
 
     def _pick_color(self, which: str) -> None:
@@ -352,23 +453,17 @@ class AddEditRuleDialog(QDialog):
             else:
                 self._fg_color = color.name()
             preview = self._bg_preview if which == "bg" else self._fg_preview
-            self._update_preview_widget(which, preview)
+            self._update_preview(which, preview)
 
     def _clear_color(self, which: str) -> None:
         if which == "bg":
             self._bg_color = ""
-            self._update_preview_widget("bg", self._bg_preview)
+            self._update_preview("bg", self._bg_preview)
         else:
             self._fg_color = ""
-            self._update_preview_widget("fg", self._fg_preview)
+            self._update_preview("fg", self._fg_preview)
 
-    @staticmethod
-    def _update_preview_widget(which: str, preview: QLabel) -> None:
-        # We can't read the color value here easily without a closure,
-        # so callers pass it directly. This method is only used as a static helper.
-        pass
-
-    def _update_preview_widget(self, which: str, preview: QLabel) -> None:  # noqa: F811
+    def _update_preview(self, which: str, preview: QLabel) -> None:
         color = self._bg_color if which == "bg" else self._fg_color
         if color:
             preview.setStyleSheet(
@@ -379,20 +474,32 @@ class AddEditRuleDialog(QDialog):
                 "background: transparent; border: 1px dashed #888; border-radius: 4px;"
             )
 
+    # ------------------------------------------------------------------
+    # Target toggle
+    # ------------------------------------------------------------------
+
     def _on_target_changed(self, text: str) -> None:
-        """Show/hide the 'Highlight Column' row depending on whether target is Cell."""
         is_cell = text.lower() == "cell"
         self._apply_col_lbl.setVisible(is_cell)
         self._apply_col_combo.setVisible(is_cell)
 
+    # ------------------------------------------------------------------
+    # Result
+    # ------------------------------------------------------------------
+
     def get_rule(self) -> dict:
+        conditions = [
+            row.get_condition()
+            for row in self._condition_rows
+            if row.get_condition()["column"]
+        ]
+        if not conditions:
+            conditions = [{"column": "", "op": ">", "value": ""}]
         apply_col = ""
         if self._target_combo.currentText().lower() == "cell":
             apply_col = self._apply_col_combo.currentData() or ""
         return {
-            "column":       self._col_combo.currentText(),
-            "op":           self._op_combo.currentText(),
-            "value":        self._val_edit.text().strip(),
+            "conditions":   conditions,
             "target":       self._target_combo.currentText().lower(),
             "apply_column": apply_col,
             "bg_color":     self._bg_color,
@@ -408,7 +515,6 @@ def _is_dark(hex_color: str) -> bool:
     """Return True if hex_color has low perceived brightness (better for white text)."""
     try:
         c = QColor(hex_color)
-        # Standard relative luminance approximation
         return (0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()) < 128
     except Exception:
         return True

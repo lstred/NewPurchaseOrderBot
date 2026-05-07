@@ -134,6 +134,7 @@ class MainWindow(QMainWindow):
         self._date_start = QDateEdit()
         self._date_start.setDisplayFormat("yyyy-MM-dd")
         self._date_start.setCalendarPopup(True)
+        self._date_start.setMinimumWidth(110)
         default_start = date(2025, 8, 4)
         self._date_start.setDate(
             QDate(default_start.year, default_start.month, default_start.day)
@@ -144,6 +145,7 @@ class MainWindow(QMainWindow):
         self._date_end = QDateEdit()
         self._date_end.setDisplayFormat("yyyy-MM-dd")
         self._date_end.setCalendarPopup(True)
+        self._date_end.setMinimumWidth(110)
         today = date.today()
         self._date_end.setDate(
             QDate(today.year, today.month, today.day)
