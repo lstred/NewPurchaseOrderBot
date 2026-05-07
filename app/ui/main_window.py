@@ -202,7 +202,7 @@ class MainWindow(QMainWindow):
         start = date(qs.year(), qs.month(), qs.day())
         end = date(qe.year(), qe.month(), qe.day())
 
-        self._thread = QThread()
+        self._thread = QThread(self)
         self._worker = _Worker(self._filters, start, end)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -210,6 +210,8 @@ class MainWindow(QMainWindow):
         self._worker.error.connect(self._on_data_error)
         self._worker.finished.connect(self._thread.quit)
         self._worker.error.connect(self._thread.quit)
+        self._thread.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
     def _on_data_ready(self, bundle: DatasetBundle) -> None:
