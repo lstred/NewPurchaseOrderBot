@@ -583,8 +583,9 @@ NewPurchBot/
       main_window.py         — MainWindow: toolbar, tabs, QThread background loader
       tab_overview.py        — Overview tab: 6 KPI cards + 21-column SKU table
       tab_timeline.py        — Inventory Timeline: 180-day Plotly projection per SKU
-      tab_fillrate.py        — Fill Rate: histogram + per-SKU table
-      tab_problems.py        — Problem Areas: alert cards with snooze + Timeline button      tab_daily_pos.py       — Daily POs: per-date PO activity grouped by operator initials      tab_settings.py        — Settings: stock-turn targets at all filter levels
+      tab_problems.py        — Problem Areas: alert cards with snooze + Timeline button
+      tab_daily_pos.py       — Daily POs: per-date PO activity grouped by operator initials
+      tab_settings.py        — Settings: stock-turn targets at all filter levels
       timeline_popup.py      — Reusable TimelineDialog popup (used from Overview + Problems)
       overview_dialogs.py    — ColumnManagerDialog + ThresholdRulesDialog for Overview table
       __init__.py
@@ -761,6 +762,8 @@ All 11 tables confirmed live with data:
 | Runout risk redefined | `metrics_service.py` | Old: `inventory < lead_time_demand AND on_order == 0`. Too narrow — missed cases with a PO on order that still can't cover demand | New: `(inventory + on_order) < 1.5 × avg_daily × lead_time`. Mirrors overstock formula; no longer requires on_order == 0 |
 | Monthly sales bar chart | `timeline_popup.py`, `tab_timeline.py` | Users wanted to see last-12-months bar chart in both popup and Timeline tab | Added `_build_monthly_chart(sku, bundle)` helper in `timeline_popup.py` (imported by `tab_timeline.py`); groupby on pre-loaded `bundle.orders` — no extra SQL; 200px-tall chart placed after PO table in both views |
 | Daily POs tab | `tab_daily_pos.py`, `queries.py`, `loaders.py`, `store.py`, `main_window.py` | Users wanted to see POs placed on any given day, grouped by operator | New tab "📋 Daily POs": date picker (defaults today), Load button, collapsible per-operator sections, SKU-level DataTable with same column-manager + color-rules as Overview, double-click → TimelineDialog; operator initials → full name mapping stored in `operator_names.json` |
+| Daily POs: Overstock column + remove icon | `tab_daily_pos.py` | User wanted Overstock alongside Runout Risk and no warning icon glyphs in any data table | Added `Overstock` column (Yes/No from `overstock_flag`); changed Runout Risk display from `⚠  Yes` to plain `Yes` |
+| Removed Fill Rate tab | `main_window.py` | Fill rate is already shown as a column option in multiple tables and KPI cards; the dedicated tab was redundant | Removed `FillRateTab` import, instantiation, `addTab`, and `refresh()` call. `tab_fillrate.py` left in place (unreferenced) so fill-rate logic stays available if needed; no metrics or column data affected |
 
 ---
 

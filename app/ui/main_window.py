@@ -18,7 +18,6 @@ from PyQt6.QtWidgets import (
 from app.services.metrics_service import DatasetBundle, compute_all
 from app.ui.tab_overview import OverviewTab
 from app.ui.tab_timeline import TimelineTab
-from app.ui.tab_fillrate import FillRateTab
 from app.ui.tab_problems import ProblemAreasTab
 from app.ui.tab_settings import SettingsTab
 from app.ui.tab_daily_pos import DailyPOsTab
@@ -91,14 +90,12 @@ class MainWindow(QMainWindow):
 
         self._overview_tab = OverviewTab()
         self._timeline_tab = TimelineTab()
-        self._fillrate_tab = FillRateTab()
         self._problems_tab = ProblemAreasTab()
         self._daily_pos_tab = DailyPOsTab()
         self._settings_tab = SettingsTab()
 
         self._tabs.addTab(self._overview_tab,   "📊  Overview")
         self._tabs.addTab(self._timeline_tab,   "📈  Inventory Timeline")
-        self._tabs.addTab(self._fillrate_tab,   "✅  Fill Rate")
         self._tabs.addTab(self._problems_tab,   "⚠  Problem Areas")
         self._tabs.addTab(self._daily_pos_tab,  "📋  Daily POs")
         self._tabs.addTab(self._settings_tab,   "⚙  Settings")
@@ -230,7 +227,6 @@ class MainWindow(QMainWindow):
 
         self._overview_tab.refresh(bundle)
         self._timeline_tab.refresh(bundle)
-        self._fillrate_tab.refresh(bundle)
         self._problems_tab.refresh(bundle)
         self._daily_pos_tab.refresh(bundle)
         self._settings_tab.refresh(bundle.filter_values)

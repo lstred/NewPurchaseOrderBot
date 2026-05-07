@@ -70,6 +70,7 @@ _TABLE_COLS: list[str] = [
     "Days of Inv",
     "Rating",
     "Runout Risk",
+    "Overstock",
 ]
 
 _TABLE_ID = "daily_pos"
@@ -118,6 +119,8 @@ def _build_row(row: pd.Series, metrics_map: dict) -> list:
 
     runout = m.get("runout_risk", False) if m else False
 
+    overstock = m.get("overstock_flag", False) if m else False
+
     return [
         str(row.get("order_number", "")),
         base_sku,
@@ -137,7 +140,8 @@ def _build_row(row: pd.Series, metrics_map: dict) -> list:
         f"{avg_daily:.3f}"                                        if m else "—",
         (f"{doi:.0f}d" if doi < _INF else "∞")                   if m else "—",
         str(m.get("sku_rating", "—"))                             if m else "—",
-        ("⚠  Yes" if runout else "No")                            if m else "—",
+        ("Yes" if runout else "No")                               if m else "—",
+        ("Yes" if overstock else "No")                            if m else "—",
     ]
 
 
