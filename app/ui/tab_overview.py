@@ -131,8 +131,8 @@ class PriceClassDetailDialog(QDialog):
         table_cols = [
             "SKU", "Description", "Rating",
             "Inventory (SY)", "On Order (SY)", "Net Inv",
-            "Avg Daily (SY)", "Days of Inv", "Inv Age (days)", "Fill Rate",
-            "Runout Risk", "Days Since Sale", "Launch Date", "Lead Time (days)",
+            "Avg Daily (SY)", "Total Sales (SY)", "Days of Inv", "Inv Age (days)", "Fill Rate",
+            "Overstock", "Runout Risk", "Days Since Sale", "Launch Date", "Lead Time (days)",
             "Turn", "Target Turn",
         ]
         self._table = DataTable(table_cols, table_id="overview_detail")
@@ -188,9 +188,11 @@ class PriceClassDetailDialog(QDialog):
                 f"{row.get('on_order_sy', 0):,.1f}",
                 f"{row.get('net_inventory_sy', 0):,.1f}",
                 f"{row.get('avg_daily_sales_sy', 0):.2f}",
+                f"{row.get('total_qty_sy', 0):,.1f}",
                 doi_str,
                 f"{row.get('inventory_age_days', 0):.0f}",
                 f"{fr * 100:.1f}%",
+                "Yes" if row.get("overstock_flag") else "No",
                 "Yes" if row.get("runout_risk") else "No",
                 _safe_days(row.get("days_since_last_sale")),
                 str(row.get("launch_date")) if pd.notna(row.get("launch_date")) else "—",
@@ -199,19 +201,21 @@ class PriceClassDetailDialog(QDialog):
                 f"{row.get('stockturn_target', 4.0):.1f}x",
             ])
 
-        inv_tot  = df["inventory_sy"].sum()
-        ord_tot  = df["on_order_sy"].sum()
-        avg_tot  = df["avg_daily_sales_sy"].sum()
-        doi_tot  = inv_tot / avg_tot if avg_tot > 0 else _INF
-        oc       = df["orders_count"].sum()
-        fr_tot   = ((df["fill_rate"] * df["orders_count"]).sum() / oc) if oc > 0 else 1.0
+        inv_tot   = df["inventory_sy"].sum()
+        ord_tot   = df["on_order_sy"].sum()
+        avg_tot   = df["avg_daily_sales_sy"].sum()
+        sales_tot = df["total_qty_sy"].sum() if "total_qty_sy" in df.columns else 0.0
+        doi_tot   = inv_tot / avg_tot if avg_tot > 0 else _INF
+        oc        = df["orders_count"].sum()
+        fr_tot    = ((df["fill_rate"] * df["orders_count"]).sum() / oc) if oc > 0 else 1.0
         totals = {
-            "SKUs":       f"{len(df):,}",
-            "Inventory":  f"{inv_tot:,.1f} SY",
-            "On Order":   f"{ord_tot:,.1f} SY",
-            "Avg Daily":  f"{avg_tot:.2f} SY/day",
+            "SKUs":        f"{len(df):,}",
+            "Inventory":   f"{inv_tot:,.1f} SY",
+            "On Order":    f"{ord_tot:,.1f} SY",
+            "Total Sales": f"{sales_tot:,.1f} SY",
+            "Avg Daily":   f"{avg_tot:.2f} SY/day",
             "Days of Inv": f"{doi_tot:.0f}d" if doi_tot < _INF else "∞",
-            "Fill Rate":  f"{fr_tot*100:.1f}%",
+            "Fill Rate":   f"{fr_tot*100:.1f}%",
         }
         return rows, totals
 
@@ -254,7 +258,7 @@ class OverviewTab(QWidget):
     _PC_TABLE_COLS = [
         "Price Class", "Description", "SKUs",
         "Inventory (SY)", "On Order (SY)", "Net Inv",
-        "Avg Daily (SY)", "Days of Inv", "Fill Rate",
+        "Avg Daily (SY)", "Total Sales (SY)", "Days of Inv", "Fill Rate",
         "Runout Risk", "Overstock", "Stock Turn", "Ratings A/B/C/D",
     ]
 
@@ -376,8 +380,8 @@ class OverviewTab(QWidget):
         self._table_cols = [
             "SKU", "Description", "Price Class", "Cost Center", "Rating",
             "Inventory (SY)", "On Order (SY)", "Net Inv",
-            "Avg Daily (SY)", "Orders", "Backorders", "BO Qty (SY)",
-            "Days of Inv", "Inv Age (days)", "Fill Rate", "Runout Risk",
+            "Avg Daily (SY)", "Total Sales (SY)", "Orders", "Backorders", "BO Qty (SY)",
+            "Days of Inv", "Inv Age (days)", "Fill Rate", "Overstock", "Runout Risk",
             "Days Since Sale", "Launch Date", "Lead Time (days)", "Turn", "Target Turn",
         ]
         self._table = DataTable(self._table_cols, table_id="overview")
@@ -461,6 +465,7 @@ class OverviewTab(QWidget):
             on_order  = g["on_order_sy"].sum()
             net_inv   = g["net_inventory_sy"].sum()
             avg_daily = g["avg_daily_sales_sy"].sum()
+            sales_sy  = g["total_qty_sy"].sum() if "total_qty_sy" in g.columns else 0.0
             doi       = inv_sy / avg_daily if avg_daily > 0 else _INF
             oc        = g["orders_count"].sum()
             fr        = ((g["fill_rate"] * g["orders_count"]).sum() / oc) if oc > 0 else 1.0
@@ -476,6 +481,7 @@ class OverviewTab(QWidget):
                 f"{inv_sy:,.1f}", f"{on_order:,.1f}",
                 f"{net_inv:,.1f}",
                 f"{avg_daily:.2f}",
+                f"{sales_sy:,.1f}",
                 f"{doi:.0f}" if doi < _INF else "∞",
                 f"{fr * 100:.1f}%",
                 str(runout), str(overstock), f"{turn:.2f}x", ratings,
@@ -504,12 +510,14 @@ class OverviewTab(QWidget):
                 f"{row.get('on_order_sy', 0):,.1f}",
                 f"{row.get('net_inventory_sy', 0):,.1f}",
                 f"{row.get('avg_daily_sales_sy', 0):.2f}",
+                f"{row.get('total_qty_sy', 0):,.1f}",
                 str(int(row.get("orders_count", 0))),
                 str(int(row.get("backorder_count", 0))),
                 f"{row.get('strict_bo_qty_sy', 0):,.1f}",
                 doi_str,
                 f"{row.get('inventory_age_days', 0):.0f}",
                 f"{fr * 100:.1f}%",
+                "Yes" if row.get("overstock_flag") else "No",
                 "Yes" if row.get("runout_risk") else "No",
                 _safe_days(row.get("days_since_last_sale")),
                 str(launch) if pd.notna(launch) else "—",
@@ -536,7 +544,8 @@ class OverviewTab(QWidget):
         if filters.get("price_classes"):
             df = df[df["price_class"].isin(filters["price_classes"])]
         if filters.get("product_lines"):
-            df = df[df["product_line"].isin(filters["product_lines"])]
+            pl_sel = {str(p).strip() for p in filters["product_lines"]}
+            df = df[df["product_line"].str.strip().isin(pl_sel)]
         if filters.get("sku_ratings"):
             df = df[df["sku_rating"].isin(filters["sku_ratings"])]
         return df

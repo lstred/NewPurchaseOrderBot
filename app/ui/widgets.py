@@ -608,20 +608,27 @@ class FilterSidebar(QFrame):
                 self._cc_list.set_valid(cc_valid)
                 self._sup_list.set_valid(sup_valid)
                 self._pc_list.set_valid(pc_valid)
-                self._pl_list.set_valid(pl_valid)
+                # Product line: if no non-empty values found (items have no PL assigned),
+                # show all options rather than hiding everything.
+                if pl_valid:
+                    self._pl_list.set_valid(pl_valid)
+                else:
+                    self._pl_list.show_all()
         finally:
             for cb in all_cbs:
                 cb.blockSignals(False)
 
     def _compute_valid(self, fv, dim: str, *constraints) -> set:
-        """Return valid values for ``dim`` after applying all other active selections."""
+        """Return valid non-empty values for ``dim`` after applying all other active selections."""
         import pandas as pd
 
         mask = pd.Series(True, index=fv.index)
         for col, sel in constraints:
             if sel and col in fv.columns:
                 mask &= fv[col].isin(sel)
-        return set(fv.loc[mask, dim].dropna().astype(str).str.strip())
+        # Strip empty strings — items with no value for this dimension should not
+        # cause the whole checklist to collapse to zero options.
+        return {v for v in fv.loc[mask, dim].dropna().astype(str).str.strip() if v}
 
     def _reset(self) -> None:
         """Clear all selections and restore all filter items."""
