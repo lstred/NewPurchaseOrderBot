@@ -11,7 +11,7 @@ from datetime import date
 from typing import Optional
 
 import pandas as pd
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
     QSizePolicy, QSplitter, QVBoxLayout, QWidget,
@@ -202,22 +202,19 @@ class TimelineDialog(QDialog):
                     layout.insertWidget(i, self._chart_widget)
                     break
 
-        # PO table — build from open_pos directly so lines without ETA also appear
+        # PO table — defer populate until after dialog is fully shown so the
+        # WebEngine layout recalculation doesn't collapse the table rows.
         po_rows = []
-        if not bundle.open_pos.empty and "base_sku" in bundle.open_pos.columns:
-            sku_pos = bundle.open_pos[
-                bundle.open_pos["base_sku"].str.strip() == sku.strip()
-            ]
-            for _, pr in sku_pos.iterrows():
-                eta = pr.get("eta_date")
-                po_rows.append([
-                    str(pr.get("order_number", "")),
-                    str(eta) if pd.notna(eta) else "No ETA",
-                    f"{pr.get('quantity_sy', 0):,.1f}",
-                    str(pr.get("supplier_number", "")),
-                ])
-            po_rows.sort(key=lambda r: r[1])
-        self._po_table.populate(po_rows)
+        for ev in po_events:
+            eta = ev.get("eta_date")
+            po_rows.append([
+                str(ev.get("order_number", "")),
+                str(eta) if pd.notna(eta) else "No ETA",
+                f"{ev.get('quantity_sy', 0):,.1f}",
+                str(ev.get("supplier_number", "")),
+            ])
+        po_rows.sort(key=lambda r: r[1])
+        QTimer.singleShot(80, lambda rows=po_rows: self._po_table.populate(rows))
 
         # Recommendation
         rec = _build_recommendation(row, stockout_day)
@@ -360,11 +357,15 @@ def _build_recommendation(row: pd.Series, stockout_day) -> str:
             f"Recommended order qty: {needed:,.0f} SY to reach {target:.1f}\u00d7 turn target."
         )
     if row.get("overstock_flag"):
-        doi = float(row.get("days_of_inventory", _INF))
-        doi_str = f"{doi:.0f}d" if doi < _INF else "\u221e"
+        lt_demand = avg_daily * lead_time
+        inv_at_arrival = max(inv_sy - lt_demand, 0)
+        proj = inv_at_arrival + on_order
+        proj_days = proj / avg_daily if avg_daily > 0 else _INF
+        proj_days_str = f"{proj_days:.0f}d" if proj_days < _INF else "\u221e"
         return (
-            f"\u26a0 Overstock: {doi_str} of inventory vs. target {target_doi:.0f}d "
-            f"({target:.1f}\u00d7 turn). Consider pausing or reducing future orders."
+            f"\u26a0 Overstock: after the on-order arrives, projected supply is {proj:,.0f}\u00a0SY "
+            f"(~{proj_days_str}), which exceeds 3\u00d7 the {lead_time}-day lead-time demand "
+            f"({lt_demand * 3:,.0f}\u00a0SY). Consider pausing or reducing future orders."
         )
     if row.get("excess_order_flag"):
         total = inv_sy + on_order

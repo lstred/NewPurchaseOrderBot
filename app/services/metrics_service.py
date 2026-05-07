@@ -394,20 +394,22 @@ def _compute_sku_metrics(
     m["is_new"] = m["launch_date"].apply(
         lambda d: (today - d).days < 180 if pd.notna(d) else False
     )
-    # Overstock: total supply (inventory + on-order) exceeds 3× lead-time demand.
-    # If net_inventory > 3 × (avg_daily × lead_time), we have far more supply than
-    # needed for the next replenishment cycle.
-    _lead_demand_3x = m["avg_daily_sales_sy"] * m["lead_time_days"] * 3
+    # Overstock: project inventory AFTER the next on-order PO arrives.
+    # Before the PO lands, avg_daily × lead_time worth of stock will have sold.
+    # projected_post_receipt = max(inventory - daily×lead_time, 0) + on_order
+    # Flag overstock when that figure exceeds 3× one lead-time's worth of demand.
+    _lt_demand = m["avg_daily_sales_sy"] * m["lead_time_days"]
+    _inv_at_arrival = (m["inventory_sy"] - _lt_demand).clip(lower=0)
+    _proj_post_receipt = _inv_at_arrival + m["on_order_sy"]
     m["overstock_flag"] = (
-        (m["net_inventory_sy"] > _lead_demand_3x)
+        (_proj_post_receipt > _lt_demand * 3)
         & (m["avg_daily_sales_sy"] > 0)
         & (m["inventory_sy"] > 0)
         & ~m["is_new"]
     ).fillna(False)
-    # Excess orders: open POs would push total supply above 2.5× lead-time demand
-    _lead_demand_2_5x = m["avg_daily_sales_sy"] * m["lead_time_days"] * 2.5
+    # Excess-order: same projected formula but 2.5× threshold and requires open PO
     m["excess_order_flag"] = (
-        (m["net_inventory_sy"] > _lead_demand_2_5x)
+        (_proj_post_receipt > _lt_demand * 2.5)
         & (m["on_order_sy"] > 0)
         & (m["avg_daily_sales_sy"] > 0)
         & ~m["is_new"]

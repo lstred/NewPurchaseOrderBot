@@ -207,21 +207,17 @@ class TimelineTab(QWidget):
             else:
                 update_chart_widget(self._chart_widget, fig)
 
-        # PO detail table — build from open_pos directly so lines without ETA also appear
+        # PO detail table — populate from po_events (same source as chart markers)
         po_rows = []
-        if not self._bundle.open_pos.empty and "base_sku" in self._bundle.open_pos.columns:
-            sku_pos = self._bundle.open_pos[
-                self._bundle.open_pos["base_sku"].str.strip() == sku.strip()
-            ]
-            for _, pr in sku_pos.iterrows():
-                eta = pr.get("eta_date")
-                po_rows.append([
-                    str(pr.get("order_number", "")),
-                    str(eta) if pd.notna(eta) else "No ETA",
-                    f"{pr.get('quantity_sy', 0):,.1f}",
-                    str(pr.get("supplier_number", "")),
-                ])
-            po_rows.sort(key=lambda r: r[1])
+        for ev in po_events:
+            eta = ev.get("eta_date")
+            po_rows.append([
+                str(ev.get("order_number", "")),
+                str(eta) if pd.notna(eta) else "No ETA",
+                f"{ev.get('quantity_sy', 0):,.1f}",
+                str(ev.get("supplier_number", "")),
+            ])
+        po_rows.sort(key=lambda r: r[1])
         self._po_table.populate(po_rows)
 
         # Recommendation
@@ -346,11 +342,15 @@ class TimelineTab(QWidget):
                 f"Recommended order quantity: {needed:.0f} SY to reach {target:.1f}x turn target."
             )
         if row.get("overstock_flag"):
-            _inf = float("inf")
-            doi = float(row.get("days_of_inventory", _inf))
+            lt_demand = avg_daily * lead_time
+            inv_at_arrival = max(inv_sy - lt_demand, 0)
+            proj = inv_at_arrival + on_order
+            proj_days = proj / avg_daily if avg_daily > 0 else float("inf")
+            proj_days_str = f"{proj_days:.0f}d" if proj_days < float("inf") else "∞"
             return (
-                f"⚠ Overstock detected: {doi:.0f} days of inventory vs. target "
-                f"{target_doi:.0f} days ({target:.1f}x turn). Consider pausing or reducing future orders."
+                f"⚠ Overstock: after the on-order arrives, projected supply is {proj:,.0f} SY "
+                f"(~{proj_days_str}), exceeding 3× the {lead_time}-day lead-time demand "
+                f"({lt_demand * 3:,.0f} SY). Consider pausing or reducing future orders."
             )
         if row.get("excess_order_flag"):
             return (
