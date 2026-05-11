@@ -7,7 +7,7 @@ SCHEMA_PROMPT = """You are a SQL assistant for an inventory analyst at a floorin
 Database: NRF_REPORTS (Microsoft SQL Server, schema dbo).
 
 YOUR JOB:
-You output ONE of two things, never both:
+You output ONE of three things, never combined:
 
 (A) A clarifying question. Use this when the user's request is ambiguous (unclear which table/column, missing date range, missing filter on cost center, unclear unit of measure, etc.). Format:
     QUESTION: <one or two short, specific questions>
@@ -22,8 +22,13 @@ You output ONE of two things, never both:
     - Use TOP N (not LIMIT).
     - Wrap any column whose name contains '#', '@' or '$' in [square brackets] with the special character. Examples: [ORDER#], [ACCOUNT#I], [$PRCCD], [$DESC], [D@QTYO], [RCODE@].
     - Use LTRIM(RTRIM(col)) when joining/filtering CHAR-padded codes (AS/400 origin).
+    - **Always honor any USER PREFERENCES & NOTES listed below** unless the user explicitly overrides them in this turn.
 
-After QUESTION: or SQL: lines, output NOTHING ELSE — no explanation, no markdown fences, no prose.
+(C) A persistent memory entry. Use this when the user is teaching you a rule, fact, preference, or business nuance that should apply to all future turns (phrases like "remember that", "always", "note that", "from now on", "never", etc.). Format:
+    REMEMBER: <single concise factual sentence, no quotes, no prose around it>
+    Save only ONE fact per REMEMBER line. The app will store it persistently and inject it into every future system prompt. After a REMEMBER line, output nothing else (do not also produce SQL in the same turn — wait for the user to re-ask).
+
+After QUESTION:, SQL:, or REMEMBER: lines, output NOTHING ELSE — no explanation, no markdown fences, no prose.
 
 TABLES (dbo schema):
 
@@ -131,23 +136,39 @@ UNITS: All quantities in the app are normalized to square yards (SY). For raw qu
 """
 
 
-def build_system_prompt(saved_queries: list[dict] | None = None) -> str:
-    """Append a brief library of previously-confirmed working queries to the system prompt.
+def build_system_prompt(
+    saved_queries: list[dict] | None = None,
+    notes: list[dict] | None = None,
+) -> str:
+    """Build the full system prompt with the user's persistent notes and saved-query library.
 
-    Only sends name + 1-line description (no SQL body) to keep token cost low.
-    The user can ask the AI to "use the saved query named X" or to base a new query on one.
+    Notes (the AI "memory bank") are injected verbatim and the AI is instructed to honor
+    them on every turn — this is how the user teaches business nuances once and never again.
+
+    Saved queries contribute only their name + short description (no SQL body) to keep
+    token cost low while letting the AI reference them by name.
     """
-    base = SCHEMA_PROMPT
-    if not saved_queries:
-        return base
-    lines = ["", "PREVIOUSLY CONFIRMED WORKING QUERIES (the user can run these directly from the UI):"]
-    for q in saved_queries[:25]:
-        name = str(q.get("name", "")).strip()
-        desc = str(q.get("description", "")).strip().replace("\n", " ")
-        if not name:
-            continue
-        if desc:
-            lines.append(f"  - {name}: {desc[:140]}")
-        else:
-            lines.append(f"  - {name}")
-    return base + "\n" + "\n".join(lines) + "\n"
+    parts = [SCHEMA_PROMPT]
+
+    if notes:
+        parts.append("\nUSER PREFERENCES & NOTES (always apply unless the user overrides them in the current turn):")
+        for i, n in enumerate(notes, 1):
+            text = str(n.get("text", "")).strip().replace("\n", " ")
+            if text:
+                parts.append(f"  {i}. {text}")
+        parts.append("")
+
+    if saved_queries:
+        parts.append("PREVIOUSLY CONFIRMED WORKING QUERIES (the user can run these directly from the UI):")
+        for q in saved_queries[:25]:
+            name = str(q.get("name", "")).strip()
+            desc = str(q.get("description", "")).strip().replace("\n", " ")
+            if not name:
+                continue
+            if desc:
+                parts.append(f"  - {name}: {desc[:140]}")
+            else:
+                parts.append(f"  - {name}")
+        parts.append("")
+
+    return "\n".join(parts)

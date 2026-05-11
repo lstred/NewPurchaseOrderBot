@@ -70,7 +70,7 @@ _PARAM_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def parse_response(text: str) -> tuple[str, str]:
-    """Return ('question', text) or ('sql', text) or ('text', text)."""
+    """Return ('question', text), ('sql', text), ('remember', fact) or ('text', text)."""
     s = text.strip()
     # Strip code fences if present
     if "```" in s:
@@ -80,8 +80,11 @@ def parse_response(text: str) -> tuple[str, str]:
             s = m.group(1).strip()
 
     # Look for explicit markers from our prompt format
+    rem_match = re.search(r"(?im)^\s*REMEMBER:\s*(.+)$", s)
     q_match = re.search(r"(?im)^\s*QUESTION:\s*(.+)$", s)
     sql_match = re.search(r"(?is)^\s*SQL:\s*(.+)$", s)
+    if rem_match:
+        return ("remember", rem_match.group(1).strip().rstrip("."))
     if sql_match:
         return ("sql", _clean_sql(sql_match.group(1)))
     if q_match:
@@ -242,6 +245,7 @@ class AITab(QWidget):
         self._param_defaults: dict[str, str] = {}
         self._build_ui()
         self._refresh_saved_list()
+        self._refresh_notes_list()
 
     # ---- UI ---------------------------------------------------------------
 
@@ -257,9 +261,13 @@ class AITab(QWidget):
         h.setChildrenCollapsible(False)
         outer.addWidget(h, stretch=1)
 
-        # ---------- Sidebar: saved queries ----------
-        side = QWidget()
-        sl = QVBoxLayout(side)
+        # ---------- Sidebar: saved queries + memory (vertical split) ----------
+        side_split = QSplitter(Qt.Orientation.Vertical)
+        side_split.setChildrenCollapsible(False)
+
+        # Saved queries
+        sq_wrap = QWidget()
+        sl = QVBoxLayout(sq_wrap)
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(6)
         sl.addWidget(SectionTitle("Saved Queries"))
@@ -279,7 +287,42 @@ class AITab(QWidget):
         side_btns.addWidget(self._btn_edit_saved)
         side_btns.addWidget(self._btn_del_saved)
         sl.addLayout(side_btns)
-        h.addWidget(side)
+        side_split.addWidget(sq_wrap)
+
+        # Memory bank (persistent AI notes)
+        mem_wrap = QWidget()
+        ml_side = QVBoxLayout(mem_wrap)
+        ml_side.setContentsMargins(0, 0, 0, 0)
+        ml_side.setSpacing(6)
+        ml_side.addWidget(SectionTitle("🧠  Memory"))
+        mem_hint = QLabel(
+            "Persistent rules the AI applies on every turn. "
+            "Type <i>“remember…”</i> in chat or use the buttons."
+        )
+        mem_hint.setWordWrap(True)
+        mem_hint.setStyleSheet(f"color:{theme.get('text_muted')}; font-size:11px;")
+        ml_side.addWidget(mem_hint)
+        self._notes_list = QListWidget()
+        self._notes_list.setWordWrap(True)
+        self._notes_list.itemDoubleClicked.connect(lambda *_: self._edit_note())
+        ml_side.addWidget(self._notes_list, stretch=1)
+        mem_btns = QHBoxLayout()
+        mem_btns.setSpacing(4)
+        self._btn_add_note = QPushButton("+ Add")
+        self._btn_add_note.clicked.connect(self._add_note)
+        self._btn_edit_note = QPushButton("Edit")
+        self._btn_edit_note.clicked.connect(self._edit_note)
+        self._btn_del_note = QPushButton("Delete")
+        self._btn_del_note.setObjectName("danger")
+        self._btn_del_note.clicked.connect(self._delete_note)
+        mem_btns.addWidget(self._btn_add_note)
+        mem_btns.addWidget(self._btn_edit_note)
+        mem_btns.addWidget(self._btn_del_note)
+        ml_side.addLayout(mem_btns)
+        side_split.addWidget(mem_wrap)
+
+        side_split.setSizes([280, 280])
+        h.addWidget(side_split)
 
         # ---------- Main column ----------
         main = QWidget()
@@ -292,7 +335,10 @@ class AITab(QWidget):
             "Ask in plain English — for example: "
             "<i>“top 20 SKUs by sales last 90 days”</i> · "
             "<i>“open POs for cost center 010 due this month”</i>. "
-            "If the AI is unsure it will ask a clarifying question."
+            "If the AI is unsure it will ask a clarifying question. "
+            "Teach it persistent rules with phrases like "
+            "<i>“remember to exclude supplier 001 when discussing suppliers”</i> — "
+            "saved entries appear in the <b>Memory</b> panel and apply to every future chat."
         )
         info.setWordWrap(True)
         info.setStyleSheet(f"color:{theme.get('text_muted')};")
@@ -446,6 +492,64 @@ class AITab(QWidget):
         store.delete_saved_query(q["id"])
         self._refresh_saved_list()
 
+    # ---- Memory / notes ---------------------------------------------------
+
+    def _refresh_notes_list(self) -> None:
+        self._notes_list.clear()
+        notes = store.get_ai_notes()
+        if not notes:
+            placeholder = QListWidgetItem("(no memory entries yet)")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._notes_list.addItem(placeholder)
+            return
+        for n in notes:
+            item = QListWidgetItem(n["text"])
+            item.setToolTip(n["text"] + f"\n\nAdded: {n.get('created', '')}")
+            item.setData(Qt.ItemDataRole.UserRole, n)
+            self._notes_list.addItem(item)
+
+    def _selected_note(self) -> Optional[dict]:
+        it = self._notes_list.currentItem()
+        if not it:
+            return None
+        return it.data(Qt.ItemDataRole.UserRole)
+
+    def _add_note(self) -> None:
+        from PyQt6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Add memory entry",
+            "Enter a rule, fact, or preference the AI should always apply:",
+            "",
+        )
+        if ok and text.strip():
+            store.add_ai_note(text.strip())
+            self._refresh_notes_list()
+            self._set_status("✓ Memory entry added.", "success")
+
+    def _edit_note(self) -> None:
+        from PyQt6.QtWidgets import QInputDialog
+        n = self._selected_note()
+        if not n:
+            return
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Edit memory entry", "Update text:", n["text"],
+        )
+        if ok and text.strip():
+            store.update_ai_note(n["id"], text.strip())
+            self._refresh_notes_list()
+
+    def _delete_note(self) -> None:
+        n = self._selected_note()
+        if not n:
+            return
+        if QMessageBox.question(
+            self, "Delete memory entry",
+            f"Delete this note?\n\n• {n['text']}\n\nThis cannot be undone.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        store.delete_ai_note(n["id"])
+        self._refresh_notes_list()
+
     def _on_save_current(self) -> None:
         sql = self._sql_view.toPlainText().strip()
         if not sql:
@@ -524,8 +628,11 @@ class AITab(QWidget):
         self._append_transcript("user", _escape_html(question))
         self._input.clear()
 
-        # Build system prompt with saved-query awareness
-        sys_prompt = build_system_prompt(store.get_saved_queries())
+        # Build system prompt with saved-query awareness + persistent memory notes
+        sys_prompt = build_system_prompt(
+            store.get_saved_queries(),
+            store.get_ai_notes(),
+        )
 
         self._set_busy(True, f"Asking {provider}…")
         self._thread = QThread(self)
@@ -556,6 +663,24 @@ class AITab(QWidget):
         if kind == "question":
             self._append_transcript("assistant", _escape_html(body))
             self._set_status("AI asked a clarifying question — type your answer above.", "muted")
+            return
+
+        if kind == "remember":
+            saved = store.add_ai_note(body)
+            self._refresh_notes_list()
+            if saved is None:
+                self._append_transcript(
+                    "assistant",
+                    f"<span style='color:{theme.get('text_muted')}'>(nothing to remember)</span>",
+                )
+                self._set_status("Memory unchanged.", "muted")
+            else:
+                self._append_transcript(
+                    "assistant",
+                    f"<span style='color:{theme.get('success')}'>🧠 Saved to memory:</span> "
+                    f"{_escape_html(body)}"
+                )
+                self._set_status("✓ Added to AI memory — will apply to every future turn.", "success")
             return
 
         if kind == "sql":
@@ -657,6 +782,9 @@ class AITab(QWidget):
         self._save_btn.setEnabled(not busy)
         self._input.setEnabled(not busy)
         self._btn_run_saved.setEnabled(not busy)
+        self._btn_add_note.setEnabled(not busy)
+        self._btn_edit_note.setEnabled(not busy)
+        self._btn_del_note.setEnabled(not busy)
         if busy:
             self._set_status(msg or "Working…", "muted")
 
