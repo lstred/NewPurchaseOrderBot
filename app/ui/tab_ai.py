@@ -103,6 +103,13 @@ def _clean_sql(s: str) -> str:
     return m.group(0).strip() if m else s
 
 
+# Pseudo-functions that appear in the schema prompt as shorthand. If the AI
+# pastes them literally instead of expanding them inline, SQL Server throws
+# error 195 ("not a recognized built-in function name"). Catch them up-front
+# and feed a precise correction request back into the conversation.
+_PSEUDO_FUNCS = re.compile(r"\b(to_sy|convert_to_sy|to_square_yards)\s*\(", re.IGNORECASE)
+
+
 def validate_sql(sql: str) -> Optional[str]:
     if not sql:
         return "Empty SQL."
@@ -112,6 +119,12 @@ def validate_sql(sql: str) -> Optional[str]:
         return "Query contains a forbidden keyword (write/DDL operations are blocked)."
     if ";" in sql:
         return "Multiple statements are not allowed (remove ';')."
+    m = _PSEUDO_FUNCS.search(sql)
+    if m:
+        return (
+            f"`{m.group(1)}(...)` is shorthand from the schema prompt — it is NOT a real "
+            "SQL Server function. Expand the UoM-to-SY CASE block inline instead."
+        )
     return None
 
 
@@ -243,6 +256,9 @@ class AITab(QWidget):
         self._history: list[dict] = []
         # Remembered parameter defaults (per-session)
         self._param_defaults: dict[str, str] = {}
+        # Number of consecutive auto-retries triggered by validation/SQL errors,
+        # capped at MAX_AUTO_RETRIES per user turn to prevent infinite loops.
+        self._auto_retries: int = 0
         self._build_ui()
         self._refresh_saved_list()
         self._refresh_notes_list()
@@ -627,6 +643,8 @@ class AITab(QWidget):
         self._history.append({"role": "user", "content": question})
         self._append_transcript("user", _escape_html(question))
         self._input.clear()
+        # Reset retry counter — new user-initiated turn
+        self._auto_retries = 0
 
         # Build system prompt with saved-query awareness + persistent memory notes
         sys_prompt = build_system_prompt(
@@ -634,7 +652,14 @@ class AITab(QWidget):
             store.get_ai_notes(),
         )
 
-        self._set_busy(True, f"Asking {provider}…")
+        self._start_worker(provider, api_key, model, sys_prompt, f"Asking {provider}…")
+
+    # Hard cap on automatic retry rounds per user turn (prevents loops).
+    MAX_AUTO_RETRIES = 2
+
+    def _start_worker(self, provider: str, api_key: str, model: str,
+                      sys_prompt: str, status_msg: str) -> None:
+        self._set_busy(True, status_msg)
         self._thread = QThread(self)
         self._worker = _AIWorker(provider, api_key, model, sys_prompt, list(self._history))
         self._worker.moveToThread(self._thread)
@@ -645,6 +670,44 @@ class AITab(QWidget):
         self._thread.finished.connect(self._on_thread_finished)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
+
+    def _request_ai_fix(self, error_msg: str, kind: str) -> bool:
+        """Append an error report to history and (if under retry cap) re-prompt the AI.
+
+        Returns True if a retry was kicked off, False if the cap was hit.
+        """
+        self._history.append({
+            "role": "user",
+            "content": (
+                f"The SQL you produced failed with this {kind} error:\n{error_msg}\n\n"
+                "Please reply with corrected SQL only — no prose."
+            ),
+        })
+        if self._auto_retries >= self.MAX_AUTO_RETRIES:
+            self._append_transcript(
+                "user",
+                f"<i>(auto) reported {kind} error to AI \u2014 retry limit reached, "
+                "type your next message to continue.</i>",
+            )
+            return False
+        self._auto_retries += 1
+        self._append_transcript(
+            "user",
+            f"<i>(auto) reported {kind} error to AI \u2014 asking for a fix "
+            f"(attempt {self._auto_retries}/{self.MAX_AUTO_RETRIES}).</i>",
+        )
+        cfg = store.get_ai_config()
+        provider = cfg.get("provider", "anthropic")
+        api_key = cfg.get("api_key", "")
+        model = cfg.get("model") or DEFAULT_MODELS.get(provider, "")
+        sys_prompt = build_system_prompt(
+            store.get_saved_queries(),
+            store.get_ai_notes(),
+        )
+        self._start_worker(provider, api_key, model, sys_prompt,
+                           f"Auto-retrying \u2014 asking {provider} to fix the SQL\u2026")
+        return True
+
 
     def _on_finished(self, result: dict) -> None:
         self._set_busy(False)
@@ -725,6 +788,8 @@ class AITab(QWidget):
         err = validate_sql(sql)
         if err:
             self._set_status(f"⚠ {err}", "danger")
+            if source == "AI":
+                self._request_ai_fix(err, kind="validation")
             return
         self._set_busy(True, f"Running query ({source})…")
         try:
@@ -734,19 +799,10 @@ class AITab(QWidget):
         except Exception as e:  # noqa: BLE001
             msg = f"{type(e).__name__}: {e}"
             self._set_status(f"⚠ {msg}", "danger")
-            # Feed error back into the conversation so the AI can self-correct
             if source == "AI":
-                self._history.append({
-                    "role": "user",
-                    "content": (
-                        f"That query failed with this error from SQL Server:\n{msg}\n\n"
-                        "Please fix it and reply with corrected SQL only."
-                    ),
-                })
-                self._append_transcript(
-                    "user",
-                    f"<i>(auto) reported execution error to AI — awaiting fix.</i>"
-                )
+                self._set_busy(False)
+                self._request_ai_fix(msg, kind="execution")
+                return
         finally:
             self._set_busy(False)
 

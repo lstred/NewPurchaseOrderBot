@@ -134,28 +134,42 @@ COMMON FILTERS:
 
 UNITS: All quantities in the app UI are normalized to square yards (SY). For raw queries, return native UOM unless the user asks for SY.
 
-UoM → SY CONVERSION (apply when the user asks for "in SY" or for any of the COMPUTED APP METRICS below).
-Requires the item's `IWIDTH` (inches) and `ICCTR` (cost-center) joined in:
-  CASE LTRIM(RTRIM(UPPER(uom)))
-    WHEN 'SY' THEN qty
-    WHEN 'SF' THEN CASE WHEN LTRIM(RTRIM(i.ICCTR)) IN ('010','011','012','013') THEN qty/9.0 ELSE qty END
-    WHEN 'LY' THEN CASE WHEN i.IWIDTH > 0 THEN qty * i.IWIDTH / 36.0  ELSE qty END
-    WHEN 'LF' THEN CASE WHEN i.IWIDTH > 0 THEN qty * i.IWIDTH / 108.0 ELSE qty END
-    WHEN 'IN' THEN CASE WHEN i.IWIDTH > 0 THEN qty * i.IWIDTH / 1296.0 ELSE qty END
-    ELSE qty
+UoM → SY CONVERSION — there is **NO `to_sy()` function in SQL Server**. `to_sy(qty, uom, width, cc)` below is shorthand for the inline `CASE` expression you must paste in its place every time. Substitute the actual column references for `qty`/`uom`/`width`/`cc`:
+
+  CASE LTRIM(RTRIM(UPPER(<uom>)))
+    WHEN 'SY' THEN <qty>
+    WHEN 'SF' THEN CASE WHEN LTRIM(RTRIM(<cc>)) IN ('010','011','012','013') THEN <qty>/9.0 ELSE <qty> END
+    WHEN 'LY' THEN CASE WHEN <width> > 0 THEN <qty> * <width> / 36.0   ELSE <qty> END
+    WHEN 'LF' THEN CASE WHEN <width> > 0 THEN <qty> * <width> / 108.0  ELSE <qty> END
+    WHEN 'IN' THEN CASE WHEN <width> > 0 THEN <qty> * <width> / 1296.0 ELSE <qty> END
+    ELSE <qty>
   END
+
+Example — total sales in SY for a window:
+  SUM(
+    CASE LTRIM(RTRIM(UPPER(o.UNIT_OF_MEASURE)))
+      WHEN 'SY' THEN o.QUANTITY_ORDERED
+      WHEN 'SF' THEN CASE WHEN LTRIM(RTRIM(i.ICCTR)) IN ('010','011','012','013') THEN o.QUANTITY_ORDERED/9.0 ELSE o.QUANTITY_ORDERED END
+      WHEN 'LY' THEN CASE WHEN i.IWIDTH > 0 THEN o.QUANTITY_ORDERED * i.IWIDTH / 36.0   ELSE o.QUANTITY_ORDERED END
+      WHEN 'LF' THEN CASE WHEN i.IWIDTH > 0 THEN o.QUANTITY_ORDERED * i.IWIDTH / 108.0  ELSE o.QUANTITY_ORDERED END
+      WHEN 'IN' THEN CASE WHEN i.IWIDTH > 0 THEN o.QUANTITY_ORDERED * i.IWIDTH / 1296.0 ELSE o.QUANTITY_ORDERED END
+      ELSE o.QUANTITY_ORDERED
+    END
+  ) AS total_sales_sy
 
 COMPUTED APP METRICS — these are what the user sees in the Overview / Daily POs / Problem Areas / Inventory Timeline tabs. They are NOT raw DB columns. If the user asks about ANY of them by name (Days of Inv, Days of Inv (Proj), Net Inv, Avg Daily SY/Sales, Total Sales (SY), Stock Turn, Fill Rate, Runout Risk, Inventory Age, etc.), you MUST compute them with the formulas below — DO NOT return the raw lead-time field `i.IDELIV` when the user asked for "Days of Inv".
 
 If the user has not specified a sales-window date range, ASK with a QUESTION line. The app default window is `2025-08-05` → today. Use placeholders `{from}` / `{to}` (ISO `YYYY-MM-DD`) so the saved query can be re-run.
 
-Per-SKU formulas (group by base_sku = COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber)):
-  inventory_sy             = SUM(to_sy(r.Available, r.RUM, i.IWIDTH, i.ICCTR))
+Per-SKU formulas (group by base_sku = COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber)). `to_sy(...)` below is the macro above — expand it inline, do NOT call it as a function:
+  inventory_sy             = SUM( to_sy(r.Available, r.RUM, i.IWIDTH, i.ICCTR) )
                              from active rolls (r.Available>0 AND r.RLOC1<>'REM' AND r.[RCODE@]<>'#' AND r.[RCODE@] NOT LIKE '%I%')
-  on_order_sy              = SUM(to_sy(d.[D@QTYO]-d.[D@QTYP], i.RUM, i.IWIDTH, i.ICCTR))
+  on_order_sy              = SUM( to_sy(d.[D@QTYO]-d.[D@QTYP], i.RUM_or_o.UNIT_OF_MEASURE, i.IWIDTH, i.ICCTR) )
                              from OPENPO_D pending lines (d.[D@ACCT]=1 AND d.[D@DEL8]<>'#' AND d.[D@SUPP]<>'001' AND d.[D@REF#]>0)
-  po_pending_qty           = SUM(to_sy(NRECEI, ...)) from OPENIV where NREFTY='R' (posted-but-not-received)
-  total_sales_sy           = SUM(to_sy(o.QUANTITY_ORDERED, o.UNIT_OF_MEASURE, i.IWIDTH, i.ICCTR))
+                             — if no UoM column is available, treat the qty as already SY
+  po_pending_qty           = SUM( to_sy(NRECEI, ...) ) from OPENIV where NREFTY='R' (posted-but-not-received)
+                             — if you cannot reliably resolve the UoM, it is acceptable to skip this term
+  total_sales_sy           = SUM( to_sy(o.QUANTITY_ORDERED, o.UNIT_OF_MEASURE, i.IWIDTH, i.ICCTR) )
                              from _ORDERS where [ACCOUNT#I]>1 AND N_NOT_INVENTORY='Y'
                              AND ORDER_ENTRY_DATE_YYYYMMDD BETWEEN
                                  TRY_CONVERT(int, REPLACE('{from}','-','')) AND TRY_CONVERT(int, REPLACE('{to}','-',''))
@@ -173,6 +187,8 @@ Per-SKU formulas (group by base_sku = COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),'')
                              AND inventory_sy > 0 AND avg_daily_sales_sy > 0
 
 Pattern: build per-SKU CTEs (sales, inv, on_order, pending) keyed on base_sku, then join and compute the metric in the final SELECT. Cost-center exclusion (`LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'`) still applies.
+
+REMINDER: SQL Server has no `to_sy`, `convert_to_sy`, or any custom UoM function. If you write `to_sy(...)` literally in your SQL, the query WILL fail with error 195 ("not a recognized built-in function name"). Always expand the CASE block inline.
 """
 
 
