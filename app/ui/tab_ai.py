@@ -277,6 +277,9 @@ class AITab(QWidget):
         self._inspect_remaining: int = 3
         # Cache of {table_name_lower: "col1 (TYPE), col2 (TYPE), ..."} per session
         self._column_cache: dict[str, str] = {}
+        # True when the SQL currently in `_sql_view` was emitted by the AI (vs.
+        # hand-typed/edited). Manual Run on AI-sourced SQL still auto-fixes.
+        self._sql_from_ai: bool = False
         self._build_ui()
         self._refresh_saved_list()
         self._refresh_notes_list()
@@ -457,6 +460,9 @@ class AITab(QWidget):
             f"background:{theme.get('bg_card')}; color:{theme.get('text')}; "
             f"font-family:Consolas,'Courier New',monospace; font-size:12px;"
         )
+        # Any manual edit invalidates the AI-origin flag (so user-typed SQL
+        # doesn't get fed back to the AI for "fixing" on errors).
+        self._sql_view.textChanged.connect(self._on_sql_view_edited)
         sw.addWidget(self._sql_view)
         sql_btns = QHBoxLayout()
         sql_btns.addStretch(1)
@@ -517,7 +523,10 @@ class AITab(QWidget):
             values = dlg.values()
             self._param_defaults.update(values)
             sql = apply_parameters(sql, values)
+        self._sql_view.blockSignals(True)
         self._sql_view.setPlainText(sql)
+        self._sql_view.blockSignals(False)
+        self._sql_from_ai = False
         self._execute_sql(sql, source=f"saved: {q['name']}")
 
     def _edit_saved(self) -> None:
@@ -638,6 +647,7 @@ class AITab(QWidget):
         self._history = []
         self._transcript.clear()
         self._sql_view.clear()
+        self._sql_from_ai = False
         self._diagnostic_remaining = 1
         self._inspect_remaining = 3
         self._hide_zero_panel()
@@ -801,7 +811,10 @@ class AITab(QWidget):
             return
 
         if kind == "sql":
+            self._sql_view.blockSignals(True)
             self._sql_view.setPlainText(body)
+            self._sql_view.blockSignals(False)
+            self._sql_from_ai = True
             self._append_transcript(
                 "assistant",
                 f"<i>Generated SQL ({len(body)} chars). Running…</i>"
@@ -956,11 +969,16 @@ class AITab(QWidget):
 
     # ---- SQL execution ----------------------------------------------------
 
+    def _on_sql_view_edited(self) -> None:
+        """User typed in the SQL view — drop the AI-origin flag so manual Run
+        treats this as user-authored SQL (no auto-fix loop on errors).
+        """
+        self._sql_from_ai = False
+
     def _on_run_manual(self) -> None:
         sql = self._sql_view.toPlainText().strip()
         if not sql:
             return
-        # If there are unsubstituted parameters, prompt first
         params = find_parameters(sql)
         if params:
             dlg = ParameterDialog(params, self._param_defaults, self)
@@ -969,7 +987,11 @@ class AITab(QWidget):
             values = dlg.values()
             self._param_defaults.update(values)
             sql = apply_parameters(sql, values)
-        self._execute_sql(sql, source="manual")
+        # If this SQL came from the AI and hasn't been manually edited, route
+        # any errors back through the auto-fix pipeline (source="AI") instead
+        # of just showing a red error blob to the user.
+        source = "AI" if self._sql_from_ai else "manual"
+        self._execute_sql(sql, source=source)
 
     def _execute_sql(self, sql: str, source: str = "") -> None:
         sql = _clean_sql(sql)

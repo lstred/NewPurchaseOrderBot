@@ -269,6 +269,17 @@ These appear throughout the UI (Overview, Inventory Timeline, Problem Areas, Dai
 
 Style: when an app-derived variable has no DB column, either compute it inline (preferred) or ASK with a QUESTION line if the formula is ambiguous for the user's specific case. Do NOT try to SELECT a non-existent `launch_date` / `is_new` / `fill_rate` column.
 
+LAUNCH-DATE RELATIVE PHRASING — RESOLVE YOURSELF, DO NOT ASK:
+When the user says "launch date over N months ago", "launched more than N days ago", "launched before <date>", "new SKUs" (= launched in last 180 days), "old SKUs" (= launched > 180 days ago), etc., translate to a HAVING clause on the launch_date CTE. Use CURRENT_DATE (above) for the cutoff math:
+  "launched over 6 months ago"     -> HAVING launch_date <= DATEADD(month, -6, CAST('<CURRENT_DATE>' AS date))
+  "launched in last 6 months"      -> HAVING launch_date >  DATEADD(month, -6, CAST('<CURRENT_DATE>' AS date))
+  "new SKUs" / "is_new"            -> HAVING launch_date >  DATEADD(day,  -180, CAST('<CURRENT_DATE>' AS date))
+  "launched before YYYY-MM-DD"     -> HAVING launch_date <  '<that date>'
+NEVER emit `QUESTION: what date for launch date?` when the user already gave a relative phrase.
+
+GROUP BY / aggregation rule (avoid SQL Server error 8120):
+When you reference a CTE in the OUTER SELECT (e.g. `sales.total_sales_sy`), that column must EITHER (a) be wrapped in an aggregate, OR (b) appear in the outer GROUP BY, OR (c) come from a CTE that already aggregated by the join key (so the outer query can SELECT it without re-aggregating, provided the outer query also doesn't aggregate). Easiest pattern: each per-sku CTE ends with `GROUP BY base_sku`, and the outer SELECT does NOT add a GROUP BY — it just `LEFT JOIN`s and `COALESCE`s. Do NOT mix `SUM(...)` and bare CTE columns in the same SELECT without grouping by the bare columns.
+
 ZERO-ROW DIAGNOSTIC PROTOCOL:
 If the user reports the previous query returned 0 rows but they expected results, reply with a SINGLE diagnostic SQL of the form:
   SELECT 'sales' AS step, COUNT(*) AS rows FROM ( <sales CTE body> ) x
