@@ -3,15 +3,19 @@ Condensed schema + behavior prompt for the AI tab.
 Kept small to minimize input tokens.
 """
 
+from datetime import date, timedelta
+from typing import Optional
+
 SCHEMA_PROMPT = """You are a SQL assistant for an inventory analyst at a flooring distributor.
 Database: NRF_REPORTS (Microsoft SQL Server, schema dbo).
 
 YOUR JOB:
 You output ONE of three things, never combined:
 
-(A) A clarifying question. Use this when the user's request is ambiguous (unclear which table/column, missing date range, missing filter on cost center, unclear unit of measure, etc.). Format:
+(A) A clarifying question. Use this when the user's request is genuinely ambiguous (unclear which table/column, unclear unit of measure, conflicting filters, etc.). Format:
     QUESTION: <one or two short, specific questions>
     Do NOT guess. Do NOT output SQL after a QUESTION line.
+    DO NOT ask for an explicit date range when the user already used a relative phrase like "today", "yesterday", "last 7 days", "last month", "this week", "MTD", "YTD", "this/last quarter", "this/last year", "in May", "in 2026", etc. — RESOLVE those yourself using CURRENT_DATE (see below). Only ask for dates when there is NO date phrasing at all AND the question is inherently time-bounded.
 
 (B) A SQL query. Use this only when you are confident.
     SQL: <the query on the same line or starting on the next line>
@@ -136,8 +140,10 @@ INTENT MAPPING (user phrasing -> table):
   "sales" / "orders shipped" / "invoices"      -> dbo.ORDERS  (filter on ORDER_ENTRY_DATE_YYYYMMDD or INVOICE_SHIP_DATE)
   "on hand" / "inventory" / "rolls"            -> dbo.ROLLS
   "receipts" / "posted POs"                     -> dbo.OPENIV
-  If OPENPO_D has no entry-date column the user expects, ASK with QUESTION:
-  rather than silently filtering the wrong table.
+  If you are not 100% sure which OPENPO_D column holds the entry/order date the user wants,
+  emit `INSPECT: dbo.OPENPO_D` first to see the real column list — do NOT guess column
+  names like `D@DATE` (this column does NOT exist). When in doubt about ANY date
+  column on ANY table, INSPECT first.
 
 JOIN PATTERN — "top N SKUs by <metric>" (CRITICAL):
   Many metrics combine sales + inventory + on_order. If a SKU has zero sales in
@@ -273,19 +279,89 @@ Keep it short. Do not explain. The app will run it and feed back the counts; on 
 """
 
 
+def _build_date_context(today: date) -> str:
+    """Render the CURRENT_DATE block + relative-date cheat-sheet.
+
+    Pre-computes common windows so the AI never has to do calendar math itself —
+    just substitutes the YYYYMMDD ints into ORDER_ENTRY_DATE_YYYYMMDD filters.
+    """
+    t = today
+    y = t - timedelta(days=1)
+    last7_start = t - timedelta(days=6)
+    last30_start = t - timedelta(days=29)
+    last90_start = t - timedelta(days=89)
+    # Week (Mon-Sun)
+    week_start = t - timedelta(days=t.weekday())
+    last_week_end = week_start - timedelta(days=1)
+    last_week_start = last_week_end - timedelta(days=6)
+    # Month
+    month_start = t.replace(day=1)
+    prev_month_end = month_start - timedelta(days=1)
+    prev_month_start = prev_month_end.replace(day=1)
+    # Quarter
+    q = (t.month - 1) // 3
+    q_start = date(t.year, q * 3 + 1, 1)
+    prev_q_end = q_start - timedelta(days=1)
+    pq = (prev_q_end.month - 1) // 3
+    prev_q_start = date(prev_q_end.year, pq * 3 + 1, 1)
+    # Year
+    year_start = date(t.year, 1, 1)
+    last_year_start = date(t.year - 1, 1, 1)
+    last_year_end = date(t.year - 1, 12, 31)
+
+    def ymd(d: date) -> str:
+        return d.strftime("%Y%m%d")
+
+    def disp(d: date) -> str:
+        return d.strftime("%Y-%m-%d")
+
+    return (
+        f"\nCURRENT_DATE: {disp(t)} (today). Today's YYYYMMDD = {ymd(t)}.\n"
+        "When the user uses ANY relative date phrasing, RESOLVE IT YOURSELF using the\n"
+        "pre-computed windows below. Substitute the YYYYMMDD ints directly into\n"
+        "`o.ORDER_ENTRY_DATE_YYYYMMDD BETWEEN <start> AND <end>` filters.\n"
+        "NEVER ask the user for explicit dates when the windows below cover their phrasing.\n"
+        "\n"
+        "RELATIVE DATE WINDOWS (start, end as YYYYMMDD ints):\n"
+        f"  today                  -> {ymd(t)}, {ymd(t)}\n"
+        f"  yesterday              -> {ymd(y)}, {ymd(y)}\n"
+        f"  last 7 days            -> {ymd(last7_start)}, {ymd(t)}\n"
+        f"  last 30 days           -> {ymd(last30_start)}, {ymd(t)}\n"
+        f"  last 90 days           -> {ymd(last90_start)}, {ymd(t)}\n"
+        f"  this week (Mon-today)  -> {ymd(week_start)}, {ymd(t)}\n"
+        f"  last week (Mon-Sun)    -> {ymd(last_week_start)}, {ymd(last_week_end)}\n"
+        f"  this month / MTD       -> {ymd(month_start)}, {ymd(t)}\n"
+        f"  last month             -> {ymd(prev_month_start)}, {ymd(prev_month_end)}\n"
+        f"  this quarter           -> {ymd(q_start)}, {ymd(t)}\n"
+        f"  last quarter           -> {ymd(prev_q_start)}, {ymd(prev_q_end)}\n"
+        f"  YTD / this year        -> {ymd(year_start)}, {ymd(t)}\n"
+        f"  last year              -> {ymd(last_year_start)}, {ymd(last_year_end)}\n"
+        "For \"last N days/weeks/months\" with N not in the table, compute it from CURRENT_DATE\n"
+        "yourself (last N days = CURRENT_DATE - (N-1) through CURRENT_DATE, inclusive).\n"
+        "For \"in <Month>\" / \"in <Month YYYY>\", use the first and last day of that month.\n"
+        "When ambiguous between calendar month and trailing 30 days, pick CALENDAR MONTH.\n"
+    )
+
+
 def build_system_prompt(
     saved_queries: list[dict] | None = None,
     notes: list[dict] | None = None,
+    today: Optional[date] = None,
 ) -> str:
-    """Build the full system prompt with the user's persistent notes and saved-query library.
+    """Build the full system prompt with date context, persistent notes and saved-query library.
 
     Notes (the AI "memory bank") are injected verbatim and the AI is instructed to honor
     them on every turn — this is how the user teaches business nuances once and never again.
 
     Saved queries contribute only their name + short description (no SQL body) to keep
     token cost low while letting the AI reference them by name.
+
+    `today` is injected so the AI can resolve relative date phrases ("last 7 days",
+    "last month", "MTD", etc.) without asking the user for explicit dates.
     """
-    parts = [SCHEMA_PROMPT]
+    if today is None:
+        today = date.today()
+    parts = [SCHEMA_PROMPT, _build_date_context(today)]
 
     if notes:
         parts.append("\nUSER PREFERENCES & NOTES (always apply unless the user overrides them in the current turn):")

@@ -703,7 +703,9 @@ class AITab(QWidget):
         self._start_worker(provider, api_key, model, sys_prompt, f"Asking {provider}…")
 
     # Hard cap on automatic retry rounds per user turn (prevents loops).
-    MAX_AUTO_RETRIES = 2
+    # 3 is the sweet spot: 1st retry usually fixes typos via the auto-attached
+    # column hint, 2nd handles INSPECT round-trips, 3rd is the safety net.
+    MAX_AUTO_RETRIES = 3
 
     def _start_worker(self, provider: str, api_key: str, model: str,
                       sys_prompt: str, status_msg: str) -> None:
