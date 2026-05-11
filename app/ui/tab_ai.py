@@ -259,6 +259,9 @@ class AITab(QWidget):
         # Number of consecutive auto-retries triggered by validation/SQL errors,
         # capped at MAX_AUTO_RETRIES per user turn to prevent infinite loops.
         self._auto_retries: int = 0
+        # Zero-row interactive diagnostic state
+        self._last_zero_sql: str = ""
+        self._diagnostic_remaining: int = 1   # one diagnostic round per user turn
         self._build_ui()
         self._refresh_saved_list()
         self._refresh_notes_list()
@@ -383,6 +386,30 @@ class AITab(QWidget):
         self._status.setWordWrap(True)
         self._status.setStyleSheet(f"color:{theme.get('text_muted')};")
         ml.addWidget(self._status)
+
+        # Zero-row diagnostic panel (hidden until needed)
+        self._zero_panel = QFrame()
+        self._zero_panel.setObjectName("zeroRowPanel")
+        self._zero_panel.setStyleSheet(
+            f"#zeroRowPanel {{ background:{theme.get('bg_card')}; "
+            f"border:1px solid {theme.get('warning')}; border-radius:6px; padding:8px; }}"
+        )
+        zp = QHBoxLayout(self._zero_panel)
+        zp.setContentsMargins(10, 6, 10, 6)
+        zp.setSpacing(8)
+        self._zero_label = QLabel(
+            "⚠  The query returned <b>0 rows</b>. Were you expecting results?"
+        )
+        self._zero_label.setStyleSheet(f"color:{theme.get('text')};")
+        zp.addWidget(self._zero_label, stretch=1)
+        self._btn_zero_yes = QPushButton("Yes — diagnose")
+        self._btn_zero_yes.clicked.connect(self._on_zero_diagnose)
+        zp.addWidget(self._btn_zero_yes)
+        self._btn_zero_no = QPushButton("No, that’s fine")
+        self._btn_zero_no.clicked.connect(self._hide_zero_panel)
+        zp.addWidget(self._btn_zero_no)
+        self._zero_panel.setVisible(False)
+        ml.addWidget(self._zero_panel)
 
         # Vertical splitter: transcript | sql | results
         v = QSplitter(Qt.Orientation.Vertical)
@@ -596,6 +623,8 @@ class AITab(QWidget):
         self._history = []
         self._transcript.clear()
         self._sql_view.clear()
+        self._diagnostic_remaining = 1
+        self._hide_zero_panel()
         self._set_status("New chat started.", "muted")
 
     def _append_transcript(self, role: str, html_body: str) -> None:
@@ -645,6 +674,8 @@ class AITab(QWidget):
         self._input.clear()
         # Reset retry counter — new user-initiated turn
         self._auto_retries = 0
+        self._diagnostic_remaining = 1
+        self._hide_zero_panel()
 
         # Build system prompt with saved-query awareness + persistent memory notes
         sys_prompt = build_system_prompt(
@@ -766,6 +797,49 @@ class AITab(QWidget):
         self._thread = None
         self._worker = None
 
+    # ---- Zero-row interactive diagnostic ---------------------------------
+
+    def _show_zero_panel(self) -> None:
+        self._zero_panel.setVisible(True)
+        self._btn_zero_yes.setEnabled(True)
+        self._btn_zero_no.setEnabled(True)
+
+    def _hide_zero_panel(self) -> None:
+        self._zero_panel.setVisible(False)
+
+    def _on_zero_diagnose(self) -> None:
+        """User confirmed they expected results — ask the AI to break down the query."""
+        if not self._last_zero_sql or self._diagnostic_remaining <= 0:
+            self._hide_zero_panel()
+            return
+        self._diagnostic_remaining -= 1
+        self._hide_zero_panel()
+        # Compact, token-efficient diagnostic prompt. The AI already has the
+        # failed SQL in history; we only nudge with the protocol reminder.
+        self._history.append({
+            "role": "user",
+            "content": (
+                "That query returned 0 rows but I expected results. Use the "
+                "ZERO-ROW DIAGNOSTIC PROTOCOL: reply with a single SQL that "
+                "counts rows in each CTE and the final join (UNION ALL of "
+                "SELECT '<step>' AS step, COUNT(*) AS rows FROM (...) x). "
+                "No prose."
+            ),
+        })
+        self._append_transcript(
+            "user",
+            "<i>(diagnose) asking the AI to count rows per CTE…</i>",
+        )
+        cfg = store.get_ai_config()
+        provider = cfg.get("provider", "anthropic")
+        api_key = cfg.get("api_key", "")
+        model = cfg.get("model") or DEFAULT_MODELS.get(provider, "")
+        sys_prompt = build_system_prompt(
+            store.get_saved_queries(), store.get_ai_notes(),
+        )
+        self._start_worker(provider, api_key, model, sys_prompt,
+                           f"Diagnosing zero-row result with {provider}…")
+
     # ---- SQL execution ----------------------------------------------------
 
     def _on_run_manual(self) -> None:
@@ -796,6 +870,12 @@ class AITab(QWidget):
             df = read_dataframe(sql)
             self._render_results(df)
             self._set_status(f"✓ {len(df):,} rows returned.", "success")
+            # Offer interactive diagnostic when AI's query came back empty
+            if len(df) == 0 and source == "AI" and self._diagnostic_remaining > 0:
+                self._last_zero_sql = sql
+                self._show_zero_panel()
+            else:
+                self._hide_zero_panel()
         except Exception as e:  # noqa: BLE001
             msg = f"{type(e).__name__}: {e}"
             self._set_status(f"⚠ {msg}", "danger")

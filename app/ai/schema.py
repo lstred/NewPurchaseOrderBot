@@ -120,7 +120,44 @@ KEY RELATIONSHIPS:
   ITEM.IIXREF                     = ITEM.ItemNumber (alias -> base)
   ROLLS.ItemNumber                = ITEM.ItemNumber
   OPENPO_D sku = D@MFGR + D@COLO + D@PATT  -> ITEM.ItemNumber
+      JOIN dbo.OPENPO_D d JOIN dbo.ITEM i
+        ON LTRIM(RTRIM(d.[D@MFGR])) + LTRIM(RTRIM(d.[D@COLO])) + LTRIM(RTRIM(d.[D@PATT])) = i.ItemNumber
+      (NEVER join OPENPO_D on `D@MFGR` alone — that is just the manufacturer code.)
+      OPENPO_D has NO UoM column — treat its qty as already in the item's native UoM
+      (use the joined ITEM.IWIDTH/ICCTR with the item's master UoM if you need SY).
   _ORDERS.CREDIT_TYPE_CODE        = CLASSES.CLCODE where CLCAT='CC'
+
+INTENT MAPPING (user phrasing -> table):
+  "POs entered" / "open POs" / "pending POs"   -> dbo.OPENPO_D  (date filter goes here, NOT on _ORDERS)
+  "sales" / "orders shipped" / "invoices"      -> dbo.ORDERS  (filter on ORDER_ENTRY_DATE_YYYYMMDD or INVOICE_SHIP_DATE)
+  "on hand" / "inventory" / "rolls"            -> dbo.ROLLS
+  "receipts" / "posted POs"                     -> dbo.OPENIV
+  If OPENPO_D has no entry-date column the user expects, ASK with QUESTION:
+  rather than silently filtering the wrong table.
+
+JOIN PATTERN — "top N SKUs by <metric>" (CRITICAL):
+  Many metrics combine sales + inventory + on_order. If a SKU has zero sales in
+  the requested window, an INNER JOIN to the sales CTE will DROP it and you
+  will get zero rows whenever the window is sparse or future-dated.
+  ALWAYS start from the SKU set (filtered ITEM rows) and **LEFT JOIN** every
+  CTE, then `COALESCE(<metric>, 0)` in the final SELECT. Example skeleton:
+      WITH sku_base AS (
+          SELECT COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber) AS base_sku
+          FROM dbo.ITEM i
+          WHERE i.IINVEN='Y' AND LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'
+          GROUP BY COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber)
+      ),
+      sales AS (...), inv AS (...), oo AS (...)
+      SELECT TOP 20 b.base_sku, ...
+      FROM sku_base b
+      LEFT JOIN sales s ON s.base_sku = b.base_sku
+      LEFT JOIN inv   i ON i.base_sku = b.base_sku
+      LEFT JOIN oo    o ON o.base_sku = b.base_sku
+      WHERE COALESCE(i.inventory_sy,0) + COALESCE(o.on_order_sy,0) > 0   -- prune empties
+      ORDER BY <metric> DESC
+  When ranking by `days_of_inv_projected` and the window has no sales, the
+  metric is undefined (divide-by-zero). Either filter `WHERE total_sales_sy > 0`
+  or rank by `(inv + on_order)` instead and tell the user.
 
 COMMON FILTERS:
   - Active inventory items:  i.IINVEN='Y' AND LEN(LTRIM(RTRIM(CAST(i.IDISCD AS VARCHAR)))) < 2
@@ -189,6 +226,14 @@ Per-SKU formulas (group by base_sku = COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),'')
 Pattern: build per-SKU CTEs (sales, inv, on_order, pending) keyed on base_sku, then join and compute the metric in the final SELECT. Cost-center exclusion (`LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'`) still applies.
 
 REMINDER: SQL Server has no `to_sy`, `convert_to_sy`, or any custom UoM function. If you write `to_sy(...)` literally in your SQL, the query WILL fail with error 195 ("not a recognized built-in function name"). Always expand the CASE block inline.
+
+ZERO-ROW DIAGNOSTIC PROTOCOL:
+If the user reports the previous query returned 0 rows but they expected results, reply with a SINGLE diagnostic SQL of the form:
+  SELECT 'sales' AS step, COUNT(*) AS rows FROM ( <sales CTE body> ) x
+  UNION ALL SELECT 'inventory', COUNT(*) FROM ( <inv CTE body> ) x
+  UNION ALL SELECT 'on_order',  COUNT(*) FROM ( <oo  CTE body> ) x
+  UNION ALL SELECT 'joined',    COUNT(*) FROM ( <full join body> ) x
+Keep it short. Do not explain. The app will run it and feed back the counts; on the NEXT turn propose a corrected query (typically: switch the empty-side INNER JOIN to LEFT JOIN, widen the date window, or fix the join key).
 """
 
 
