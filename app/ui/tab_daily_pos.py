@@ -67,7 +67,9 @@ _TABLE_COLS: list[str] = [
     "Inventory (SY)",
     "On Order (SY)",
     "Avg Daily (SY)",
+    "Total Sales (SY)",
     "Days of Inv",
+    "Days of Inv (Proj)",
     "Rating",
     "Runout Risk",
     "Overstock",
@@ -111,7 +113,9 @@ def _build_row(row: pd.Series, metrics_map: dict) -> list:
     inv_sy    = float(m.get("inventory_sy",    0)) if m else 0.0
     on_order  = float(m.get("on_order_sy",     0)) if m else 0.0
     avg_daily = float(m.get("avg_daily_sales_sy", 0)) if m else 0.0
+    total_sy  = float(m.get("total_qty_sy",    0)) if m else 0.0
     doi       = float(m.get("days_of_inventory",  _INF)) if m else _INF
+    doi_proj  = float(m.get("days_of_inventory_projected", _INF)) if m else _INF
 
     eta     = row.get("eta_date")
     eta_str = str(eta)[:10] if pd.notna(eta) else "No ETA"
@@ -139,7 +143,9 @@ def _build_row(row: pd.Series, metrics_map: dict) -> list:
         f"{inv_sy:,.1f}"                                          if m else "—",
         f"{on_order:,.1f}"                                        if m else "—",
         f"{avg_daily:.3f}"                                        if m else "—",
+        f"{total_sy:,.1f}"                                        if m else "—",
         (f"{doi:.0f}d" if doi < _INF else "∞")                   if m else "—",
+        (f"{doi_proj:.0f}d" if doi_proj < _INF else "∞")          if m else "—",
         str(m.get("sku_rating", "—"))                             if m else "—",
         ("Yes" if runout    else "No")                            if m else "—",
         ("Yes" if overstock else "No")                            if m else "—",
@@ -218,8 +224,13 @@ class _OperatorSection(QFrame):
         self._table.cellDoubleClicked.connect(self._on_double_click)
         self._table.setToolTip("Double-click any row to open its inventory timeline")
         self._table.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
+        # Disable this table's own vertical scrollbar — the outer QScrollArea
+        # owns all vertical scrolling. The table height is fitted to its rows
+        # inside populate(), giving a single smooth scrolling surface.
+        self._table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         root.addWidget(self._table)
 
     # ── Public API ──────────────────────────────────────────────────────
@@ -235,6 +246,9 @@ class _OperatorSection(QFrame):
 
     def populate(self, rows: list[list]) -> None:
         self._table.populate(rows)
+        # Resize table to fit all its rows so the outer scroll area handles
+        # the page in one continuous motion (no nested table scrollbars).
+        self._fit_table_height()
         lines = len(rows)
         try:
             total_sy = sum(float(r[5].replace(",", "")) for r in rows)
@@ -243,6 +257,20 @@ class _OperatorSection(QFrame):
         self._stats_lbl.setText(
             f"{lines:,} line{'s' if lines != 1 else ''}  │  {total_sy:,.1f} SY"
         )
+
+    def _fit_table_height(self) -> None:
+        """Set the table's fixed height to exactly accommodate its rows + header."""
+        t = self._table
+        header_h = t.horizontalHeader().height()
+        # Use the configured default row height (uniform across rows in this app)
+        row_h = t.verticalHeader().defaultSectionSize() or 28
+        # Account for visible rows only (hidden rows shouldn't take space)
+        visible_rows = sum(1 for r in range(t.rowCount()) if not t.isRowHidden(r))
+        # +2 for the table frame; +18 for the horizontal scrollbar reservation
+        # (only added if it might be shown on narrow widths)
+        h_scroll = 18 if t.horizontalScrollBar().isVisible() else 0
+        total_h = header_h + (row_h * max(visible_rows, 1)) + 4 + h_scroll
+        t.setFixedHeight(total_h)
 
     def apply_rules(self, rules: list[dict]) -> None:
         self._table.set_rules(rules)
@@ -493,8 +521,15 @@ class DailyPOsTab(QWidget):
     # ── Data loading ─────────────────────────────────────────────────────
 
     def _load_pos(self) -> None:
-        if self._thread and self._thread.isRunning():
-            return
+        # Guard against the underlying C++ QThread having been deleted between
+        # loads — Qt schedules deleteLater on the worker thread when it finishes,
+        # leaving Python with a dangling reference. Same pattern as MainWindow.
+        try:
+            if self._thread is not None and self._thread.isRunning():
+                return
+        except RuntimeError:
+            self._thread = None
+            self._worker = None
 
         qd = self._date_edit.date()
         target = date(qd.year(), qd.month(), qd.day())
@@ -516,7 +551,23 @@ class DailyPOsTab(QWidget):
         self._worker.error.connect(self._thread.quit)
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._on_thread_finished)
         self._thread.start()
+
+    def _on_thread_finished(self) -> None:
+        # Drop Python refs once Qt has scheduled the C++ objects for deletion,
+        # so the next _load_pos() doesn't poke a dangling QThread.
+        self._thread = None
+        self._worker = None
+
+    def closeEvent(self, event) -> None:  # noqa: N802 — Qt API
+        try:
+            if self._thread is not None and self._thread.isRunning():
+                self._thread.quit()
+                self._thread.wait(5000)
+        except RuntimeError:
+            pass
+        super().closeEvent(event)
 
     def _on_load_done(self, df: pd.DataFrame) -> None:
         self._po_df = df

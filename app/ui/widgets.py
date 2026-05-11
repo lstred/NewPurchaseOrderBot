@@ -206,6 +206,20 @@ class DataTable(QTableWidget):
             )
 
     # ------------------------------------------------------------------
+    # Dynamic columns (used by AI tab where columns vary per query)
+    # ------------------------------------------------------------------
+
+    def set_columns(self, columns: list[str]) -> None:
+        """Replace the column set (clears any existing data)."""
+        self.setSortingEnabled(False)
+        self.clear()
+        self.setRowCount(0)
+        self._column_names = list(columns)
+        self.setColumnCount(len(columns))
+        self.setHorizontalHeaderLabels(columns)
+        self.setSortingEnabled(True)
+
+    # ------------------------------------------------------------------
     # Column visibility
     # ------------------------------------------------------------------
 

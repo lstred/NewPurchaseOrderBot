@@ -373,8 +373,18 @@ def _compute_sku_metrics(
 
     # Derived
     m["net_inventory_sy"] = m["inventory_sy"] + m["on_order_sy"] + m["po_pending_qty"]
+    # DOI (Current) — current warehouse inventory only, divided by avg daily sales.
+    # Answers: "how many days will today's stock last at current sales velocity?"
     m["days_of_inventory"] = (
         m["inventory_sy"] / m["avg_daily_sales_sy"].replace(0, np.nan)
+    ).fillna(_INF)
+    # DOI (Projected) — current inventory + on-order + posted-but-not-received
+    # PO quantities, divided by avg daily sales. Answers: "once everything currently
+    # on the books arrives, how many days will we have on hand?" Best estimate
+    # of the *peak* days-on-hand in the near future given today's open POs.
+    m["days_of_inventory_projected"] = (
+        (m["inventory_sy"] + m["on_order_sy"] + m["po_pending_qty"])
+        / m["avg_daily_sales_sy"].replace(0, np.nan)
     ).fillna(_INF)
     m["stock_turn"] = (
         (m["avg_daily_sales_sy"] * 365) / m["inventory_sy"].replace(0, np.nan)

@@ -289,3 +289,28 @@ def get_operator_names() -> dict[str, str]:
 def save_all_operator_names(names: dict[str, str]) -> None:
     """Overwrite the entire operator-name mapping."""
     _save(_OPERATOR_NAMES_FILE, {k.upper().strip(): v.strip() for k, v in names.items() if k.strip()})
+
+
+# ---------------------------------------------------------------------------
+# AI provider configuration
+# ---------------------------------------------------------------------------
+
+_AI_CONFIG_FILE = APPDATA_DIR / "ai_config.json"
+
+
+def get_ai_config() -> dict:
+    """Return {provider, api_key, model} for the AI tab."""
+    data = _load(_AI_CONFIG_FILE)
+    return {
+        "provider": data.get("provider", "anthropic"),
+        "api_key": data.get("api_key", ""),
+        "model": data.get("model", "claude-sonnet-4-5"),
+    }
+
+
+def set_ai_config(cfg: dict) -> None:
+    _save(_AI_CONFIG_FILE, {
+        "provider": str(cfg.get("provider", "anthropic")),
+        "api_key": str(cfg.get("api_key", "")),
+        "model": str(cfg.get("model", "")),
+    })

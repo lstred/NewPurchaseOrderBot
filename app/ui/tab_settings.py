@@ -15,9 +15,11 @@ from PyQt6.QtWidgets import (
     QPushButton, QScrollArea, QVBoxLayout, QWidget, QFrame,
 )
 
-from app.data.store import get_all_targets, set_target, delete_target, get_all_launch_dates
+from app.data.store import get_all_targets, set_target, delete_target, get_all_launch_dates, get_ai_config, set_ai_config
 from app.ui.widgets import SectionTitle, HSep, DataTable
 import app.ui.theme as theme
+
+from PyQt6.QtWidgets import QLineEdit
 
 
 class SettingsTab(QWidget):
@@ -88,6 +90,39 @@ class SettingsTab(QWidget):
 
         cl.addWidget(HSep())
 
+        # ------------- AI Provider -------------
+        gb_ai = QGroupBox("AI Provider (for the AI tab)")
+        ai_form = QFormLayout(gb_ai)
+        self._ai_provider = QComboBox()
+        self._ai_provider.addItems(["anthropic", "google", "openai"])
+        ai_form.addRow("Provider:", self._ai_provider)
+        self._ai_model = QLineEdit()
+        self._ai_model.setPlaceholderText("e.g. claude-sonnet-4-5  /  gemini-2.5-flash  /  gpt-4o-mini")
+        ai_form.addRow("Model:", self._ai_model)
+        self._ai_key = QLineEdit()
+        self._ai_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._ai_key.setPlaceholderText("Paste API key (stored locally in %APPDATA%\\PurchaseOrderBot\\ai_config.json)")
+        ai_form.addRow("API Key:", self._ai_key)
+        save_ai_btn = QPushButton("Save AI Settings")
+        save_ai_btn.clicked.connect(self._save_ai_config)
+        ai_form.addRow("", save_ai_btn)
+        ai_info = QLabel(
+            "<b>Suggested models &amp; costs (per 1M tokens):</b><br>"
+            "&nbsp;&nbsp;• <b>Anthropic</b> — claude-sonnet-4-5 ($3 in / $15 out) — best at SQL · "
+            "<a href='https://console.anthropic.com'>console.anthropic.com</a><br>"
+            "&nbsp;&nbsp;• <b>Google</b> — gemini-2.5-flash ($0.30 in / $2.50 out) — cheapest, very good · "
+            "<a href='https://aistudio.google.com'>aistudio.google.com</a><br>"
+            "&nbsp;&nbsp;• <b>OpenAI</b> — gpt-4o-mini ($0.15 in / $0.60 out) — cheapest of all · "
+            "<a href='https://platform.openai.com'>platform.openai.com</a>"
+        )
+        ai_info.setOpenExternalLinks(True)
+        ai_info.setWordWrap(True)
+        ai_form.addRow(ai_info)
+        cl.addWidget(gb_ai)
+        self._load_ai_config()
+
+        cl.addWidget(HSep())
+
         # Launch dates override
         cl.addWidget(QLabel("Override Launch Dates (leave blank to use auto-detected date):"))
         self._launch_table = DataTable(["SKU", "Auto-Detected Launch Date"])
@@ -119,6 +154,22 @@ class SettingsTab(QWidget):
     def _load_global(self) -> None:
         targets = get_all_targets()
         self._global_spin.setValue(targets.get("global", 4.0))
+
+    def _load_ai_config(self) -> None:
+        cfg = get_ai_config()
+        provider = cfg.get("provider", "anthropic")
+        idx = self._ai_provider.findText(provider)
+        if idx >= 0:
+            self._ai_provider.setCurrentIndex(idx)
+        self._ai_model.setText(cfg.get("model", ""))
+        self._ai_key.setText(cfg.get("api_key", ""))
+
+    def _save_ai_config(self) -> None:
+        set_ai_config({
+            "provider": self._ai_provider.currentText().strip(),
+            "model": self._ai_model.text().strip(),
+            "api_key": self._ai_key.text().strip(),
+        })
 
     def _save_target(self, key: str, value: float) -> None:
         set_target(key, value)

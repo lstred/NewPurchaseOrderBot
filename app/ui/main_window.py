@@ -21,6 +21,7 @@ from app.ui.tab_timeline import TimelineTab
 from app.ui.tab_problems import ProblemAreasTab
 from app.ui.tab_settings import SettingsTab
 from app.ui.tab_daily_pos import DailyPOsTab
+from app.ui.tab_ai import AITab
 from app.data.db import validate_connection
 import app.ui.theme as theme
 
@@ -92,12 +93,14 @@ class MainWindow(QMainWindow):
         self._timeline_tab = TimelineTab()
         self._problems_tab = ProblemAreasTab()
         self._daily_pos_tab = DailyPOsTab()
+        self._ai_tab = AITab()
         self._settings_tab = SettingsTab()
 
         self._tabs.addTab(self._overview_tab,   "📊  Overview")
         self._tabs.addTab(self._timeline_tab,   "📈  Inventory Timeline")
         self._tabs.addTab(self._problems_tab,   "⚠  Problem Areas")
         self._tabs.addTab(self._daily_pos_tab,  "📋  Daily POs")
+        self._tabs.addTab(self._ai_tab,         "🤖  AI")
         self._tabs.addTab(self._settings_tab,   "⚙  Settings")
 
         main_layout.addWidget(self._tabs)
