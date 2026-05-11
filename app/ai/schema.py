@@ -132,7 +132,47 @@ COMMON FILTERS:
   - Cost center exclusion:   LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'   (always exclude '1xx' unless asked)
   - Order entry date parse:  TRY_CONVERT(date, CAST(o.ORDER_ENTRY_DATE_YYYYMMDD AS VARCHAR), 112)
 
-UNITS: All quantities in the app are normalized to square yards (SY). For raw queries, return native UOM.
+UNITS: All quantities in the app UI are normalized to square yards (SY). For raw queries, return native UOM unless the user asks for SY.
+
+UoM → SY CONVERSION (apply when the user asks for "in SY" or for any of the COMPUTED APP METRICS below).
+Requires the item's `IWIDTH` (inches) and `ICCTR` (cost-center) joined in:
+  CASE LTRIM(RTRIM(UPPER(uom)))
+    WHEN 'SY' THEN qty
+    WHEN 'SF' THEN CASE WHEN LTRIM(RTRIM(i.ICCTR)) IN ('010','011','012','013') THEN qty/9.0 ELSE qty END
+    WHEN 'LY' THEN CASE WHEN i.IWIDTH > 0 THEN qty * i.IWIDTH / 36.0  ELSE qty END
+    WHEN 'LF' THEN CASE WHEN i.IWIDTH > 0 THEN qty * i.IWIDTH / 108.0 ELSE qty END
+    WHEN 'IN' THEN CASE WHEN i.IWIDTH > 0 THEN qty * i.IWIDTH / 1296.0 ELSE qty END
+    ELSE qty
+  END
+
+COMPUTED APP METRICS — these are what the user sees in the Overview / Daily POs / Problem Areas / Inventory Timeline tabs. They are NOT raw DB columns. If the user asks about ANY of them by name (Days of Inv, Days of Inv (Proj), Net Inv, Avg Daily SY/Sales, Total Sales (SY), Stock Turn, Fill Rate, Runout Risk, Inventory Age, etc.), you MUST compute them with the formulas below — DO NOT return the raw lead-time field `i.IDELIV` when the user asked for "Days of Inv".
+
+If the user has not specified a sales-window date range, ASK with a QUESTION line. The app default window is `2025-08-05` → today. Use placeholders `{from}` / `{to}` (ISO `YYYY-MM-DD`) so the saved query can be re-run.
+
+Per-SKU formulas (group by base_sku = COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber)):
+  inventory_sy             = SUM(to_sy(r.Available, r.RUM, i.IWIDTH, i.ICCTR))
+                             from active rolls (r.Available>0 AND r.RLOC1<>'REM' AND r.[RCODE@]<>'#' AND r.[RCODE@] NOT LIKE '%I%')
+  on_order_sy              = SUM(to_sy(d.[D@QTYO]-d.[D@QTYP], i.RUM, i.IWIDTH, i.ICCTR))
+                             from OPENPO_D pending lines (d.[D@ACCT]=1 AND d.[D@DEL8]<>'#' AND d.[D@SUPP]<>'001' AND d.[D@REF#]>0)
+  po_pending_qty           = SUM(to_sy(NRECEI, ...)) from OPENIV where NREFTY='R' (posted-but-not-received)
+  total_sales_sy           = SUM(to_sy(o.QUANTITY_ORDERED, o.UNIT_OF_MEASURE, i.IWIDTH, i.ICCTR))
+                             from _ORDERS where [ACCOUNT#I]>1 AND N_NOT_INVENTORY='Y'
+                             AND ORDER_ENTRY_DATE_YYYYMMDD BETWEEN
+                                 TRY_CONVERT(int, REPLACE('{from}','-','')) AND TRY_CONVERT(int, REPLACE('{to}','-',''))
+  effective_days           = DATEDIFF(day, '{from}', '{to}') + 1            -- minimum 1
+  avg_daily_sales_sy       = total_sales_sy / NULLIF(effective_days, 0)
+  net_inventory_sy         = inventory_sy + on_order_sy + po_pending_qty    -- "Net Inv" column
+  days_of_inventory        = inventory_sy / NULLIF(avg_daily_sales_sy, 0)   -- "Days of Inv" column
+  days_of_inv_projected    = (inventory_sy + on_order_sy + po_pending_qty)
+                             / NULLIF(avg_daily_sales_sy, 0)                -- "Days of Inv (Proj)" column
+  stock_turn               = (avg_daily_sales_sy * 365)
+                             / NULLIF(inventory_sy, 0)                      -- "Stock Turn" KPI
+  lead_time_days           = COALESCE(NULLIF(i.IDELIV,0), NULLIF(pl.LDELIV,0), 30)   -- pl = PRODLINE
+  runout_risk (bool)       = (inventory_sy + on_order_sy)
+                             < (avg_daily_sales_sy * lead_time_days * 1.5)
+                             AND inventory_sy > 0 AND avg_daily_sales_sy > 0
+
+Pattern: build per-SKU CTEs (sales, inv, on_order, pending) keyed on base_sku, then join and compute the metric in the final SELECT. Cost-center exclusion (`LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'`) still applies.
 """
 
 
