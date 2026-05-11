@@ -314,3 +314,67 @@ def set_ai_config(cfg: dict) -> None:
         "api_key": str(cfg.get("api_key", "")),
         "model": str(cfg.get("model", "")),
     })
+
+
+# ---------------------------------------------------------------------------
+# Saved AI SQL queries (library)
+# Schema (list of dicts):
+#   {"id": str, "name": str, "description": str, "sql": str, "created": iso8601}
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid
+from datetime import datetime as _datetime
+
+_SAVED_QUERIES_FILE = APPDATA_DIR / "saved_queries.json"
+
+
+def get_saved_queries() -> list[dict]:
+    data = _load(_SAVED_QUERIES_FILE)
+    items = data.get("queries", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    out = []
+    for q in items:
+        if not isinstance(q, dict) or not q.get("sql"):
+            continue
+        out.append({
+            "id":          str(q.get("id") or _uuid.uuid4()),
+            "name":        str(q.get("name", "(unnamed)")).strip() or "(unnamed)",
+            "description": str(q.get("description", "")).strip(),
+            "sql":         str(q.get("sql", "")).strip(),
+            "created":     str(q.get("created", _datetime.now().isoformat(timespec='seconds'))),
+        })
+    out.sort(key=lambda x: x["name"].lower())
+    return out
+
+
+def _save_queries(queries: list[dict]) -> None:
+    _save(_SAVED_QUERIES_FILE, {"queries": queries})
+
+
+def add_saved_query(name: str, description: str, sql: str) -> dict:
+    queries = get_saved_queries()
+    new = {
+        "id":          str(_uuid.uuid4()),
+        "name":        str(name).strip() or "(unnamed)",
+        "description": str(description).strip(),
+        "sql":         str(sql).strip(),
+        "created":     _datetime.now().isoformat(timespec='seconds'),
+    }
+    queries.append(new)
+    _save_queries(queries)
+    return new
+
+
+def update_saved_query(query_id: str, name: str, description: str, sql: str) -> None:
+    queries = get_saved_queries()
+    for q in queries:
+        if q["id"] == query_id:
+            q["name"] = str(name).strip() or "(unnamed)"
+            q["description"] = str(description).strip()
+            q["sql"] = str(sql).strip()
+            break
+    _save_queries(queries)
+
+
+def delete_saved_query(query_id: str) -> None:
+    queries = [q for q in get_saved_queries() if q["id"] != query_id]
+    _save_queries(queries)

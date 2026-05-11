@@ -96,8 +96,8 @@ class SettingsTab(QWidget):
         self._ai_provider = QComboBox()
         self._ai_provider.addItems(["anthropic", "google", "openai"])
         ai_form.addRow("Provider:", self._ai_provider)
-        self._ai_model = QLineEdit()
-        self._ai_model.setPlaceholderText("e.g. claude-sonnet-4-5  /  gemini-2.5-flash  /  gpt-4o-mini")
+        self._ai_model = QComboBox()
+        self._ai_model.setEditable(True)
         ai_form.addRow("Model:", self._ai_model)
         self._ai_key = QLineEdit()
         self._ai_key.setEchoMode(QLineEdit.EchoMode.Password)
@@ -106,6 +106,9 @@ class SettingsTab(QWidget):
         save_ai_btn = QPushButton("Save AI Settings")
         save_ai_btn.clicked.connect(self._save_ai_config)
         ai_form.addRow("", save_ai_btn)
+        self._ai_save_status = QLabel("")
+        self._ai_save_status.setStyleSheet(f"color:{theme.get('success')}; font-weight:600;")
+        ai_form.addRow("", self._ai_save_status)
         ai_info = QLabel(
             "<b>Suggested models &amp; costs (per 1M tokens):</b><br>"
             "&nbsp;&nbsp;• <b>Anthropic</b> — claude-sonnet-4-5 ($3 in / $15 out) — best at SQL · "
@@ -119,6 +122,9 @@ class SettingsTab(QWidget):
         ai_info.setWordWrap(True)
         ai_form.addRow(ai_info)
         cl.addWidget(gb_ai)
+        # Wire provider → model auto-list (BEFORE first load so saved value sticks)
+        self._ai_provider.currentTextChanged.connect(self._on_provider_changed)
+        self._on_provider_changed(self._ai_provider.currentText())
         self._load_ai_config()
 
         cl.addWidget(HSep())
@@ -161,15 +167,44 @@ class SettingsTab(QWidget):
         idx = self._ai_provider.findText(provider)
         if idx >= 0:
             self._ai_provider.setCurrentIndex(idx)
-        self._ai_model.setText(cfg.get("model", ""))
+        # _on_provider_changed already populated model list; now apply saved model if any
+        saved_model = cfg.get("model", "").strip()
+        if saved_model:
+            self._ai_model.setCurrentText(saved_model)
         self._ai_key.setText(cfg.get("api_key", ""))
 
+    def _on_provider_changed(self, provider: str) -> None:
+        """Repopulate model dropdown with known models for the selected provider."""
+        models = {
+            "anthropic": ["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5"],
+            "google":    ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"],
+            "openai":    ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
+        }.get(provider.lower(), [])
+        current = self._ai_model.currentText().strip()
+        self._ai_model.blockSignals(True)
+        self._ai_model.clear()
+        self._ai_model.addItems(models)
+        # Pick the first (recommended) entry by default; preserve user's typed value if it was non-empty
+        if current and current not in models:
+            self._ai_model.setCurrentText(current)
+        elif models:
+            self._ai_model.setCurrentIndex(0)
+        self._ai_model.blockSignals(False)
+
     def _save_ai_config(self) -> None:
-        set_ai_config({
-            "provider": self._ai_provider.currentText().strip(),
-            "model": self._ai_model.text().strip(),
-            "api_key": self._ai_key.text().strip(),
-        })
+        provider = self._ai_provider.currentText().strip()
+        model = self._ai_model.currentText().strip()
+        api_key = self._ai_key.text().strip()
+        set_ai_config({"provider": provider, "model": model, "api_key": api_key})
+        if not api_key:
+            self._ai_save_status.setStyleSheet(f"color:{theme.get('warning')}; font-weight:600;")
+            self._ai_save_status.setText("⚠  Saved — but no API key was entered. Add one to use the AI tab.")
+        else:
+            self._ai_save_status.setStyleSheet(f"color:{theme.get('success')}; font-weight:600;")
+            self._ai_save_status.setText(f"✓  Saved.  Provider: {provider}   Model: {model or '(default)'}")
+        # Auto-clear the status after 6 seconds
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(6000, lambda: self._ai_save_status.setText(""))
 
     def _save_target(self, key: str, value: float) -> None:
         set_target(key, value)

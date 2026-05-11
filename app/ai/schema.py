@@ -1,17 +1,29 @@
 """
-Condensed schema prompt for the AI tab.
-Kept small to minimize input tokens — covers only what's needed
-to write SELECT queries against NRF_REPORTS.
+Condensed schema + behavior prompt for the AI tab.
+Kept small to minimize input tokens.
 """
 
-SCHEMA_PROMPT = """You generate Microsoft SQL Server (T-SQL) SELECT queries against database NRF_REPORTS (schema dbo).
+SCHEMA_PROMPT = """You are a SQL assistant for an inventory analyst at a flooring distributor.
+Database: NRF_REPORTS (Microsoft SQL Server, schema dbo).
 
-OUTPUT RULES (critical):
-- Output ONLY the SQL query. No prose, no markdown, no ```sql fences.
-- Must start with SELECT (or WITH ... SELECT). NEVER write INSERT/UPDATE/DELETE/DROP/TRUNCATE/EXEC/MERGE/ALTER/CREATE/GRANT.
-- ANY column whose name contains '#', '@', or '$' MUST be wrapped in [square brackets] including the special character. Examples: [ORDER#], [ACCOUNT#I], [$PRCCD], [$DESC], [D@QTYO], [RCODE@].
-- Use TOP N for limits (no LIMIT clause).
-- Use LTRIM(RTRIM(col)) when joining/filtering CHAR-padded codes (AS/400 origin).
+YOUR JOB:
+You output ONE of two things, never both:
+
+(A) A clarifying question. Use this when the user's request is ambiguous (unclear which table/column, missing date range, missing filter on cost center, unclear unit of measure, etc.). Format:
+    QUESTION: <one or two short, specific questions>
+    Do NOT guess. Do NOT output SQL after a QUESTION line.
+
+(B) A SQL query. Use this only when you are confident.
+    SQL: <the query on the same line or starting on the next line>
+    The SQL must:
+    - Be a single Microsoft SQL Server SELECT (or WITH ... SELECT) statement.
+    - NEVER include INSERT/UPDATE/DELETE/DROP/TRUNCATE/EXEC/MERGE/ALTER/CREATE/GRANT/REVOKE.
+    - NEVER end with a semicolon and NEVER contain multiple statements.
+    - Use TOP N (not LIMIT).
+    - Wrap any column whose name contains '#', '@' or '$' in [square brackets] with the special character. Examples: [ORDER#], [ACCOUNT#I], [$PRCCD], [$DESC], [D@QTYO], [RCODE@].
+    - Use LTRIM(RTRIM(col)) when joining/filtering CHAR-padded codes (AS/400 origin).
+
+After QUESTION: or SQL: lines, output NOTHING ELSE — no explanation, no markdown fences, no prose.
 
 TABLES (dbo schema):
 
@@ -112,8 +124,30 @@ COMMON FILTERS:
   - Backorder lines:         o.DETAIL_LINE_STATUS IN ('B','R')
   - Active rolls:            r.Available > 0 AND r.RLOC1 <> 'REM' AND r.[RCODE@] <> '#' AND r.[RCODE@] NOT LIKE '%I%'
   - Pending PO lines:        d.[D@ACCT]=1 AND d.[D@DEL8]<>'#' AND d.[D@SUPP]<>'001' AND d.[D@REF#]>0
-  - Cost center exclusion:   LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'   (always exclude '1xx')
+  - Cost center exclusion:   LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'   (always exclude '1xx' unless asked)
   - Order entry date parse:  TRY_CONVERT(date, CAST(o.ORDER_ENTRY_DATE_YYYYMMDD AS VARCHAR), 112)
 
-UNITS: All quantities in app are normalized to square yards (SY). For raw queries, return native UOM and explain in column alias if needed.
+UNITS: All quantities in the app are normalized to square yards (SY). For raw queries, return native UOM.
 """
+
+
+def build_system_prompt(saved_queries: list[dict] | None = None) -> str:
+    """Append a brief library of previously-confirmed working queries to the system prompt.
+
+    Only sends name + 1-line description (no SQL body) to keep token cost low.
+    The user can ask the AI to "use the saved query named X" or to base a new query on one.
+    """
+    base = SCHEMA_PROMPT
+    if not saved_queries:
+        return base
+    lines = ["", "PREVIOUSLY CONFIRMED WORKING QUERIES (the user can run these directly from the UI):"]
+    for q in saved_queries[:25]:
+        name = str(q.get("name", "")).strip()
+        desc = str(q.get("description", "")).strip().replace("\n", " ")
+        if not name:
+            continue
+        if desc:
+            lines.append(f"  - {name}: {desc[:140]}")
+        else:
+            lines.append(f"  - {name}")
+    return base + "\n" + "\n".join(lines) + "\n"

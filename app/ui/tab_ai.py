@@ -1,13 +1,25 @@
 """
-AI tab — natural-language → SQL → results.
+AI tab — natural-language → SQL → results, with conversation memory and a
+library of saved queries.
 
-* User types a question in plain English.
-* A configured LLM (Claude / OpenAI / Gemini) returns a SELECT query.
-* SQL is validated (read-only) then executed via app.data.db.read_dataframe.
-* Results render in a DataTable.
+Features
+--------
+* Chat with the configured LLM (Claude / OpenAI / Gemini). Full history is
+  preserved per session so the AI can ask clarifying questions and refine.
+* Click **New Chat** to reset the conversation.
+* Generated SQL is shown in an editable panel; the user can tweak then re-run.
+* **Save** any working query to the user's library with a name + description.
+* Saved queries are listed in the left sidebar with **Run / Edit / Delete**.
+* SQL parameters use `{name}` placeholders. When running a saved query, the
+  user is prompted for each parameter value (defaults remembered per session).
+* The AI sees the names + descriptions of saved queries (no SQL bodies) so it
+  can suggest reusing them — keeps tokens low while building "memory".
 
-Configuration (provider, API key, model) lives in the Settings tab and is
-persisted to %APPDATA%\\PurchaseOrderBot\\ai_config.json.
+Safety
+------
+Only single-statement SELECT (or WITH ... SELECT) queries are executed.
+INSERT/UPDATE/DELETE/DROP/TRUNCATE/EXEC/MERGE/ALTER/CREATE/GRANT/REVOKE/XP_/SP_
+are rejected by the validator before any database hit.
 """
 
 from __future__ import annotations
@@ -17,10 +29,17 @@ from typing import Optional
 
 import pandas as pd
 from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -31,40 +50,57 @@ from PyQt6.QtWidgets import (
 )
 
 from app.ai.providers import call_provider, AIError, DEFAULT_MODELS
-from app.ai.schema import SCHEMA_PROMPT
+from app.ai.schema import build_system_prompt
 from app.data import store
 from app.data.db import read_dataframe
 from app.ui.widgets import DataTable, SectionTitle
 import app.ui.theme as theme
 
 
-# Forbidden keywords (case-insensitive, word-boundary)
+# ---------------------------------------------------------------------------
+# SQL parsing / validation
+# ---------------------------------------------------------------------------
+
 _FORBIDDEN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|EXEC(?:UTE)?|MERGE|ALTER|CREATE|GRANT|REVOKE|XP_|SP_)\b",
     re.IGNORECASE,
 )
 _STARTS_SELECT = re.compile(r"^\s*(WITH|SELECT)\b", re.IGNORECASE)
+_PARAM_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def _sanitize_sql(text: str) -> str:
-    """Strip code fences / common prose if the model added them despite instructions."""
+def parse_response(text: str) -> tuple[str, str]:
+    """Return ('question', text) or ('sql', text) or ('text', text)."""
     s = text.strip()
-    # Remove ```sql / ``` fences
-    if s.startswith("```"):
-        s = s.strip("`")
-        # remove leading 'sql' marker
-        s = re.sub(r"^sql\s*\n?", "", s, flags=re.IGNORECASE)
-        # drop closing fence remnant
-        s = s.rstrip("`").strip()
-    # If model returned "Here's the query:\nSELECT..." trim any prose before SELECT/WITH
-    m = re.search(r"(?is)(SELECT|WITH)\s.*", s)
-    if m:
-        s = m.group(0)
-    return s.strip().rstrip(";")
+    # Strip code fences if present
+    if "```" in s:
+        # Pick the first fenced block
+        m = re.search(r"```(?:sql)?\s*(.+?)```", s, re.DOTALL | re.IGNORECASE)
+        if m:
+            s = m.group(1).strip()
+
+    # Look for explicit markers from our prompt format
+    q_match = re.search(r"(?im)^\s*QUESTION:\s*(.+)$", s)
+    sql_match = re.search(r"(?is)^\s*SQL:\s*(.+)$", s)
+    if sql_match:
+        return ("sql", _clean_sql(sql_match.group(1)))
+    if q_match:
+        # Use everything starting from QUESTION: line
+        return ("question", q_match.group(1).strip())
+    # Fallback: if the body starts with SELECT/WITH, treat as SQL
+    if _STARTS_SELECT.match(s):
+        return ("sql", _clean_sql(s))
+    return ("text", s)
+
+
+def _clean_sql(s: str) -> str:
+    s = s.strip().rstrip(";")
+    # Drop any leading prose before SELECT/WITH
+    m = re.search(r"(?is)\b(SELECT|WITH)\b.*", s)
+    return m.group(0).strip() if m else s
 
 
 def validate_sql(sql: str) -> Optional[str]:
-    """Return None if SQL is safe to run, else an error message."""
     if not sql:
         return "Empty SQL."
     if not _STARTS_SELECT.match(sql):
@@ -76,75 +112,195 @@ def validate_sql(sql: str) -> Optional[str]:
     return None
 
 
+def find_parameters(sql: str) -> list[str]:
+    """Return ordered list of unique {param_name} placeholders."""
+    seen: list[str] = []
+    for m in _PARAM_RE.finditer(sql):
+        if m.group(1) not in seen:
+            seen.append(m.group(1))
+    return seen
+
+
+def apply_parameters(sql: str, values: dict[str, str]) -> str:
+    def _sub(m: re.Match) -> str:
+        return values.get(m.group(1), m.group(0))
+    return _PARAM_RE.sub(_sub, sql)
+
+
 # ---------------------------------------------------------------------------
-# Background worker
+# Background worker — calls the provider on the AI thread
 # ---------------------------------------------------------------------------
 
 class _AIWorker(QObject):
-    finished = pyqtSignal(object)  # dict: {sql, df, error}
+    finished = pyqtSignal(object)  # dict: {ok: bool, text: str, error: str}
 
-    def __init__(self, provider: str, api_key: str, model: str, question: str):
+    def __init__(self, provider: str, api_key: str, model: str, system: str, history: list[dict]):
         super().__init__()
         self._provider = provider
         self._api_key = api_key
         self._model = model
-        self._question = question
+        self._system = system
+        self._history = history
 
     def run(self) -> None:
-        result = {"sql": "", "df": None, "error": None}
+        result = {"ok": False, "text": "", "error": None}
         try:
-            raw = call_provider(
+            result["text"] = call_provider(
                 self._provider, self._api_key, self._model,
-                SCHEMA_PROMPT, self._question,
+                self._system, self._history,
             )
-            sql = _sanitize_sql(raw)
-            result["sql"] = sql
-            err = validate_sql(sql)
-            if err:
-                result["error"] = err
-            else:
-                result["df"] = read_dataframe(sql)
+            result["ok"] = True
         except AIError as e:
-            result["error"] = f"AI error: {e}"
+            result["error"] = str(e)
         except Exception as e:  # noqa: BLE001
             result["error"] = f"{type(e).__name__}: {e}"
         self.finished.emit(result)
 
 
 # ---------------------------------------------------------------------------
-# Tab widget
+# Dialogs
+# ---------------------------------------------------------------------------
+
+class SaveQueryDialog(QDialog):
+    """Prompt for name + description (and optionally edit the SQL)."""
+
+    def __init__(self, sql: str, name: str = "", description: str = "",
+                 title: str = "Save Query", parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self._name = QLineEdit(name)
+        self._name.setPlaceholderText("e.g. Top 20 SKUs by sales")
+        self._desc = QLineEdit(description)
+        self._desc.setPlaceholderText("Short description (shown in the sidebar tooltip)")
+        form.addRow("Name:", self._name)
+        form.addRow("Description:", self._desc)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("SQL (use <code>{param_name}</code> for runtime parameters):"))
+        self._sql = QTextEdit()
+        self._sql.setPlainText(sql)
+        self._sql.setStyleSheet(
+            f"background:{theme.get('bg_card')}; color:{theme.get('text')}; "
+            f"font-family:Consolas,'Courier New',monospace; font-size:12px;"
+        )
+        self._sql.setMinimumHeight(180)
+        layout.addWidget(self._sql)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def values(self) -> tuple[str, str, str]:
+        return (
+            self._name.text().strip(),
+            self._desc.text().strip(),
+            self._sql.toPlainText().strip(),
+        )
+
+
+class ParameterDialog(QDialog):
+    """Ask the user for {param} values before running a parameterized query."""
+
+    def __init__(self, params: list[str], defaults: dict[str, str],
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Query Parameters")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Provide a value for each parameter:"))
+        form = QFormLayout()
+        self._fields: dict[str, QLineEdit] = {}
+        for p in params:
+            edit = QLineEdit(defaults.get(p, ""))
+            edit.setPlaceholderText(f"value for {{{p}}}")
+            form.addRow(f"{p}:", edit)
+            self._fields[p] = edit
+        layout.addLayout(form)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def values(self) -> dict[str, str]:
+        return {p: f.text().strip() for p, f in self._fields.items()}
+
+
+# ---------------------------------------------------------------------------
+# Tab
 # ---------------------------------------------------------------------------
 
 class AITab(QWidget):
-    """Ask plain-English questions, get SQL + results."""
-
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._thread: Optional[QThread] = None
         self._worker: Optional[_AIWorker] = None
+        # Conversation history (provider format: role + content)
+        self._history: list[dict] = []
+        # Remembered parameter defaults (per-session)
+        self._param_defaults: dict[str, str] = {}
         self._build_ui()
+        self._refresh_saved_list()
 
     # ---- UI ---------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(8)
 
-        root.addWidget(SectionTitle("🤖  AI Query"))
+        outer.addWidget(SectionTitle("🤖  AI Query"))
 
+        # Top-level horizontal splitter: sidebar | main
+        h = QSplitter(Qt.Orientation.Horizontal)
+        h.setChildrenCollapsible(False)
+        outer.addWidget(h, stretch=1)
+
+        # ---------- Sidebar: saved queries ----------
+        side = QWidget()
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.setSpacing(6)
+        sl.addWidget(SectionTitle("Saved Queries"))
+        self._saved_list = QListWidget()
+        self._saved_list.itemDoubleClicked.connect(lambda *_: self._run_saved())
+        sl.addWidget(self._saved_list, stretch=1)
+        side_btns = QHBoxLayout()
+        side_btns.setSpacing(4)
+        self._btn_run_saved = QPushButton("▶ Run")
+        self._btn_run_saved.clicked.connect(self._run_saved)
+        self._btn_edit_saved = QPushButton("Edit")
+        self._btn_edit_saved.clicked.connect(self._edit_saved)
+        self._btn_del_saved = QPushButton("Delete")
+        self._btn_del_saved.setObjectName("danger")
+        self._btn_del_saved.clicked.connect(self._delete_saved)
+        side_btns.addWidget(self._btn_run_saved)
+        side_btns.addWidget(self._btn_edit_saved)
+        side_btns.addWidget(self._btn_del_saved)
+        sl.addLayout(side_btns)
+        h.addWidget(side)
+
+        # ---------- Main column ----------
+        main = QWidget()
+        ml = QVBoxLayout(main)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.setSpacing(8)
+
+        # Hint
         info = QLabel(
-            "Ask a question about your data — for example:  "
-            "<i>“top 20 SKUs by sales last 90 days”</i>  or  "
-            "<i>“how many backordered lines for cost center 010 this month?”</i>"
+            "Ask in plain English — for example: "
+            "<i>“top 20 SKUs by sales last 90 days”</i> · "
+            "<i>“open POs for cost center 010 due this month”</i>. "
+            "If the AI is unsure it will ask a clarifying question."
         )
         info.setWordWrap(True)
         info.setStyleSheet(f"color:{theme.get('text_muted')};")
-        root.addWidget(info)
+        ml.addWidget(info)
 
         # Input row
         in_row = QHBoxLayout()
-        in_row.setSpacing(8)
+        in_row.setSpacing(6)
         self._input = QLineEdit()
         self._input.setPlaceholderText("Type your question and press Enter…")
         self._input.returnPressed.connect(self._on_send)
@@ -152,41 +308,64 @@ class AITab(QWidget):
         self._send_btn = QPushButton("Ask")
         self._send_btn.clicked.connect(self._on_send)
         self._send_btn.setMinimumHeight(34)
+        self._new_chat_btn = QPushButton("New Chat")
+        self._new_chat_btn.setMinimumHeight(34)
+        self._new_chat_btn.clicked.connect(self._on_new_chat)
         in_row.addWidget(self._input, stretch=1)
         in_row.addWidget(self._send_btn)
-        root.addLayout(in_row)
+        in_row.addWidget(self._new_chat_btn)
+        ml.addLayout(in_row)
 
-        # Status / error label
+        # Status label
         self._status = QLabel("")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(f"color:{theme.get('text_muted')};")
-        root.addWidget(self._status)
+        ml.addWidget(self._status)
 
-        # Splitter: SQL on top, results on bottom
-        split = QSplitter(Qt.Orientation.Vertical)
-        split.setChildrenCollapsible(False)
+        # Vertical splitter: transcript | sql | results
+        v = QSplitter(Qt.Orientation.Vertical)
+        v.setChildrenCollapsible(False)
 
+        # Transcript
+        tr_wrap = QWidget()
+        tw = QVBoxLayout(tr_wrap)
+        tw.setContentsMargins(0, 0, 0, 0)
+        tw.setSpacing(4)
+        tw.addWidget(SectionTitle("Conversation"))
+        self._transcript = QTextEdit()
+        self._transcript.setReadOnly(True)
+        self._transcript.setStyleSheet(
+            f"background:{theme.get('bg_card')}; color:{theme.get('text')}; "
+            f"font-size:13px;"
+        )
+        tw.addWidget(self._transcript)
+        v.addWidget(tr_wrap)
+
+        # SQL panel
         sql_wrap = QWidget()
         sw = QVBoxLayout(sql_wrap)
         sw.setContentsMargins(0, 0, 0, 0)
         sw.setSpacing(4)
         sw.addWidget(SectionTitle("Generated SQL"))
         self._sql_view = QTextEdit()
-        self._sql_view.setReadOnly(False)  # let user tweak before re-run if desired
         self._sql_view.setPlaceholderText("Generated SQL will appear here…")
         self._sql_view.setStyleSheet(
             f"background:{theme.get('bg_card')}; color:{theme.get('text')}; "
             f"font-family:Consolas,'Courier New',monospace; font-size:12px;"
         )
         sw.addWidget(self._sql_view)
-        run_row = QHBoxLayout()
-        run_row.addStretch(1)
+        sql_btns = QHBoxLayout()
+        sql_btns.addStretch(1)
+        self._save_btn = QPushButton("💾 Save Query")
+        self._save_btn.clicked.connect(self._on_save_current)
+        sql_btns.addWidget(self._save_btn)
         self._run_btn = QPushButton("▶ Run SQL")
         self._run_btn.clicked.connect(self._on_run_manual)
-        run_row.addWidget(self._run_btn)
-        sw.addLayout(run_row)
-        split.addWidget(sql_wrap)
+        sql_btns.addWidget(self._run_btn)
+        sw.addLayout(sql_btns)
+        v.addWidget(sql_wrap)
 
+        # Results
         res_wrap = QWidget()
         rw = QVBoxLayout(res_wrap)
         rw.setContentsMargins(0, 0, 0, 0)
@@ -195,12 +374,127 @@ class AITab(QWidget):
         self._table = DataTable([], table_id="ai_results")
         self._table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         rw.addWidget(self._table)
-        split.addWidget(res_wrap)
+        v.addWidget(res_wrap)
 
-        split.setSizes([220, 480])
-        root.addWidget(split, stretch=1)
+        v.setSizes([200, 220, 320])
+        ml.addWidget(v, stretch=1)
 
-    # ---- send / receive ---------------------------------------------------
+        h.addWidget(main)
+        h.setSizes([240, 900])
+
+    # ---- Saved queries ----------------------------------------------------
+
+    def _refresh_saved_list(self) -> None:
+        self._saved_list.clear()
+        for q in store.get_saved_queries():
+            item = QListWidgetItem(q["name"])
+            tip = q["description"] or "(no description)"
+            params = find_parameters(q["sql"])
+            if params:
+                tip += "\n\nParameters: " + ", ".join("{" + p + "}" for p in params)
+            item.setToolTip(tip)
+            item.setData(Qt.ItemDataRole.UserRole, q)
+            self._saved_list.addItem(item)
+
+    def _selected_saved(self) -> Optional[dict]:
+        it = self._saved_list.currentItem()
+        return it.data(Qt.ItemDataRole.UserRole) if it else None
+
+    def _run_saved(self) -> None:
+        q = self._selected_saved()
+        if not q:
+            return
+        sql = q["sql"]
+        params = find_parameters(sql)
+        if params:
+            dlg = ParameterDialog(params, self._param_defaults, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            values = dlg.values()
+            self._param_defaults.update(values)
+            sql = apply_parameters(sql, values)
+        self._sql_view.setPlainText(sql)
+        self._execute_sql(sql, source=f"saved: {q['name']}")
+
+    def _edit_saved(self) -> None:
+        q = self._selected_saved()
+        if not q:
+            return
+        dlg = SaveQueryDialog(q["sql"], q["name"], q["description"],
+                              title="Edit Saved Query", parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            name, desc, sql = dlg.values()
+            if not name or not sql:
+                QMessageBox.warning(self, "Missing fields", "Name and SQL are both required.")
+                return
+            err = validate_sql(_clean_sql(re.sub(_PARAM_RE, "1", sql)))
+            if err:
+                QMessageBox.warning(self, "Invalid SQL", err)
+                return
+            store.update_saved_query(q["id"], name, desc, sql)
+            self._refresh_saved_list()
+
+    def _delete_saved(self) -> None:
+        q = self._selected_saved()
+        if not q:
+            return
+        if QMessageBox.question(
+            self, "Delete saved query",
+            f"Delete '{q['name']}'?\n\nThis cannot be undone.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        store.delete_saved_query(q["id"])
+        self._refresh_saved_list()
+
+    def _on_save_current(self) -> None:
+        sql = self._sql_view.toPlainText().strip()
+        if not sql:
+            QMessageBox.information(self, "Nothing to save", "There is no SQL to save yet.")
+            return
+        # Validate (with placeholders substituted out) before saving
+        err = validate_sql(_clean_sql(_PARAM_RE.sub("1", sql)))
+        if err:
+            if QMessageBox.question(
+                self, "Invalid SQL",
+                f"{err}\n\nSave anyway?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+        dlg = SaveQueryDialog(sql, "", "", title="Save Query", parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, desc, sql2 = dlg.values()
+        if not name or not sql2:
+            QMessageBox.warning(self, "Missing fields", "Name and SQL are both required.")
+            return
+        store.add_saved_query(name, desc, sql2)
+        self._refresh_saved_list()
+        self._set_status(f"✓ Saved as “{name}”.", "success")
+
+    # ---- Chat -------------------------------------------------------------
+
+    def _on_new_chat(self) -> None:
+        self._history = []
+        self._transcript.clear()
+        self._sql_view.clear()
+        self._set_status("New chat started.", "muted")
+
+    def _append_transcript(self, role: str, html_body: str) -> None:
+        if role == "user":
+            color = theme.get("info")
+            label = "You"
+        elif role == "assistant":
+            color = theme.get("success")
+            label = "AI"
+        else:
+            color = theme.get("text_muted")
+            label = role
+        self._transcript.append(
+            f"<div style='margin-top:8px'>"
+            f"<span style='color:{color}; font-weight:700'>{label}:</span> {html_body}"
+            f"</div>"
+        )
+        sb = self._transcript.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _on_send(self) -> None:
         question = self._input.text().strip()
@@ -214,23 +508,28 @@ class AITab(QWidget):
             QMessageBox.warning(
                 self, "AI not configured",
                 "No API key is configured.\n\nGo to the Settings tab → AI Provider "
-                "section and enter an API key for your chosen provider."
+                "section, paste your API key for the chosen provider, then click Save."
             )
             return
-        # Don't double-fire
         try:
             if self._thread is not None and self._thread.isRunning():
-                self._status.setText("Already running…")
+                self._set_status("Already running — please wait…", "muted")
                 return
         except RuntimeError:
             self._thread = None
             self._worker = None
 
-        self._set_busy(True, f"Asking {provider}…")
-        self._sql_view.clear()
+        # Append user turn to history + transcript
+        self._history.append({"role": "user", "content": question})
+        self._append_transcript("user", _escape_html(question))
+        self._input.clear()
 
+        # Build system prompt with saved-query awareness
+        sys_prompt = build_system_prompt(store.get_saved_queries())
+
+        self._set_busy(True, f"Asking {provider}…")
         self._thread = QThread(self)
-        self._worker = _AIWorker(provider, api_key, model, question)
+        self._worker = _AIWorker(provider, api_key, model, sys_prompt, list(self._history))
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_finished)
@@ -240,51 +539,91 @@ class AITab(QWidget):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
-    def _on_run_manual(self) -> None:
-        """Run whatever SQL is currently in the editor (lets user tweak then re-run)."""
-        sql = _sanitize_sql(self._sql_view.toPlainText())
-        if not sql:
-            return
-        err = validate_sql(sql)
-        if err:
-            self._status.setText(f"⚠ {err}")
-            self._status.setStyleSheet(f"color:{theme.get('danger')};")
-            return
-        self._set_busy(True, "Running query…")
-        try:
-            df = read_dataframe(sql)
-            self._render_results(df)
-            self._status.setText(f"✓ {len(df):,} rows")
-            self._status.setStyleSheet(f"color:{theme.get('success')};")
-        except Exception as e:  # noqa: BLE001
-            self._status.setText(f"⚠ {type(e).__name__}: {e}")
-            self._status.setStyleSheet(f"color:{theme.get('danger')};")
-        finally:
-            self._set_busy(False)
-
     def _on_finished(self, result: dict) -> None:
         self._set_busy(False)
-        sql = result.get("sql", "")
-        if sql:
-            self._sql_view.setPlainText(sql)
-        err = result.get("error")
-        df = result.get("df")
-        if err:
-            self._status.setText(f"⚠ {err}")
-            self._status.setStyleSheet(f"color:{theme.get('danger')};")
+        if not result.get("ok"):
+            err = result.get("error") or "Unknown error."
+            self._append_transcript("assistant",
+                                    f"<span style='color:{theme.get('danger')}'>⚠ {_escape_html(err)}</span>")
+            self._set_status(err, "danger")
             return
-        if df is None:
-            self._status.setText("No results returned.")
+
+        text = result.get("text", "").strip()
+        kind, body = parse_response(text)
+        # Always record full assistant turn in history (so follow-ups work)
+        self._history.append({"role": "assistant", "content": text})
+
+        if kind == "question":
+            self._append_transcript("assistant", _escape_html(body))
+            self._set_status("AI asked a clarifying question — type your answer above.", "muted")
             return
-        self._render_results(df)
-        self._status.setText(f"✓ {len(df):,} rows")
-        self._status.setStyleSheet(f"color:{theme.get('success')};")
+
+        if kind == "sql":
+            self._sql_view.setPlainText(body)
+            self._append_transcript(
+                "assistant",
+                f"<i>Generated SQL ({len(body)} chars). Running…</i>"
+                f"<pre style='margin:4px 0; padding:6px; background:{theme.get('bg')}; "
+                f"border:1px solid {theme.get('border')}; "
+                f"font-family:Consolas,monospace; font-size:11px; white-space:pre-wrap;'>"
+                f"{_escape_html(body[:1500])}{'…' if len(body) > 1500 else ''}</pre>"
+            )
+            self._execute_sql(body, source="AI")
+            return
+
+        # Plain text fallback
+        self._append_transcript("assistant", _escape_html(body))
 
     def _on_thread_finished(self) -> None:
         self._thread = None
         self._worker = None
 
-    # ---- helpers ----------------------------------------------------------
+    # ---- SQL execution ----------------------------------------------------
+
+    def _on_run_manual(self) -> None:
+        sql = self._sql_view.toPlainText().strip()
+        if not sql:
+            return
+        # If there are unsubstituted parameters, prompt first
+        params = find_parameters(sql)
+        if params:
+            dlg = ParameterDialog(params, self._param_defaults, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            values = dlg.values()
+            self._param_defaults.update(values)
+            sql = apply_parameters(sql, values)
+        self._execute_sql(sql, source="manual")
+
+    def _execute_sql(self, sql: str, source: str = "") -> None:
+        sql = _clean_sql(sql)
+        err = validate_sql(sql)
+        if err:
+            self._set_status(f"⚠ {err}", "danger")
+            return
+        self._set_busy(True, f"Running query ({source})…")
+        try:
+            df = read_dataframe(sql)
+            self._render_results(df)
+            self._set_status(f"✓ {len(df):,} rows returned.", "success")
+        except Exception as e:  # noqa: BLE001
+            msg = f"{type(e).__name__}: {e}"
+            self._set_status(f"⚠ {msg}", "danger")
+            # Feed error back into the conversation so the AI can self-correct
+            if source == "AI":
+                self._history.append({
+                    "role": "user",
+                    "content": (
+                        f"That query failed with this error from SQL Server:\n{msg}\n\n"
+                        "Please fix it and reply with corrected SQL only."
+                    ),
+                })
+                self._append_transcript(
+                    "user",
+                    f"<i>(auto) reported execution error to AI — awaiting fix.</i>"
+                )
+        finally:
+            self._set_busy(False)
 
     def _render_results(self, df: pd.DataFrame) -> None:
         cols = [str(c) for c in df.columns]
@@ -298,20 +637,28 @@ class AITab(QWidget):
                     cells.append("—")
                 elif isinstance(v, float):
                     cells.append(f"{v:,.2f}")
-                elif isinstance(v, int):
+                elif isinstance(v, (int,)):
                     cells.append(f"{v:,}")
                 else:
                     cells.append(str(v))
             rows.append(cells)
         self._table.populate(rows)
 
+    # ---- Helpers ----------------------------------------------------------
+
+    def _set_status(self, msg: str, kind: str = "muted") -> None:
+        color_key = {"success": "success", "danger": "danger", "warning": "warning"}.get(kind, "text_muted")
+        self._status.setStyleSheet(f"color:{theme.get(color_key)};")
+        self._status.setText(msg)
+
     def _set_busy(self, busy: bool, msg: str = "") -> None:
         self._send_btn.setEnabled(not busy)
         self._run_btn.setEnabled(not busy)
+        self._save_btn.setEnabled(not busy)
         self._input.setEnabled(not busy)
+        self._btn_run_saved.setEnabled(not busy)
         if busy:
-            self._status.setStyleSheet(f"color:{theme.get('text_muted')};")
-            self._status.setText(msg or "Working…")
+            self._set_status(msg or "Working…", "muted")
 
     def closeEvent(self, event) -> None:  # noqa: N802
         try:
@@ -321,3 +668,12 @@ class AITab(QWidget):
         except RuntimeError:
             pass
         super().closeEvent(event)
+
+
+def _escape_html(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace("\n", "<br>")
+    )
