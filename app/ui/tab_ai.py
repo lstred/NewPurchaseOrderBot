@@ -83,8 +83,11 @@ def parse_response(text: str) -> tuple[str, str]:
     rem_match = re.search(r"(?im)^\s*REMEMBER:\s*(.+)$", s)
     q_match = re.search(r"(?im)^\s*QUESTION:\s*(.+)$", s)
     sql_match = re.search(r"(?is)^\s*SQL:\s*(.+)$", s)
+    insp_match = re.search(r"(?im)^\s*INSPECT:\s*(.+)$", s)
     if rem_match:
         return ("remember", rem_match.group(1).strip().rstrip("."))
+    if insp_match:
+        return ("inspect", insp_match.group(1).strip().rstrip("."))
     if sql_match:
         return ("sql", _clean_sql(sql_match.group(1)))
     if q_match:
@@ -108,6 +111,14 @@ def _clean_sql(s: str) -> str:
 # error 195 ("not a recognized built-in function name"). Catch them up-front
 # and feed a precise correction request back into the conversation.
 _PSEUDO_FUNCS = re.compile(r"\b(to_sy|convert_to_sy|to_square_yards)\s*\(", re.IGNORECASE)
+
+# Recognise SQL Server column-name errors so we can auto-attach the table's
+# real columns to the AI's retry message.
+_BAD_COLUMN_RE = re.compile(r"Invalid column name '([^']+)'", re.IGNORECASE)
+# Pull `dbo.Table` references out of an arbitrary SQL body for introspection.
+_TABLE_REF_RE = re.compile(r"\bdbo\.([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE)
+# Validate an INSPECT target is a safe identifier (no quotes, no spaces, etc.)
+_SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def validate_sql(sql: str) -> Optional[str]:
@@ -262,6 +273,10 @@ class AITab(QWidget):
         # Zero-row interactive diagnostic state
         self._last_zero_sql: str = ""
         self._diagnostic_remaining: int = 1   # one diagnostic round per user turn
+        # INSPECT round-trips per user turn (cap to keep cost bounded)
+        self._inspect_remaining: int = 3
+        # Cache of {table_name_lower: "col1 (TYPE), col2 (TYPE), ..."} per session
+        self._column_cache: dict[str, str] = {}
         self._build_ui()
         self._refresh_saved_list()
         self._refresh_notes_list()
@@ -624,6 +639,7 @@ class AITab(QWidget):
         self._transcript.clear()
         self._sql_view.clear()
         self._diagnostic_remaining = 1
+        self._inspect_remaining = 3
         self._hide_zero_panel()
         self._set_status("New chat started.", "muted")
 
@@ -675,6 +691,7 @@ class AITab(QWidget):
         # Reset retry counter — new user-initiated turn
         self._auto_retries = 0
         self._diagnostic_remaining = 1
+        self._inspect_remaining = 3
         self._hide_zero_panel()
 
         # Build system prompt with saved-query awareness + persistent memory notes
@@ -777,6 +794,10 @@ class AITab(QWidget):
                 self._set_status("✓ Added to AI memory — will apply to every future turn.", "success")
             return
 
+        if kind == "inspect":
+            self._handle_inspect_request(body)
+            return
+
         if kind == "sql":
             self._sql_view.setPlainText(body)
             self._append_transcript(
@@ -796,6 +817,97 @@ class AITab(QWidget):
     def _on_thread_finished(self) -> None:
         self._thread = None
         self._worker = None
+
+    # ---- Schema introspection (INSPECT: dbo.Table) -----------------------
+
+    def _describe_table(self, table: str) -> Optional[str]:
+        """Return a comma-separated `name (TYPE)` list for a dbo table, or None on failure."""
+        key = table.strip().lower()
+        if key in self._column_cache:
+            return self._column_cache[key]
+        if not _SAFE_IDENT_RE.match(table):
+            return None
+        try:
+            df = read_dataframe(
+                "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS "
+                f"WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='{table}' "
+                "ORDER BY ORDINAL_POSITION"
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if df.empty:
+            return None
+        parts = [f"{r['COLUMN_NAME']} ({r['DATA_TYPE']})" for _, r in df.iterrows()]
+        out = ", ".join(parts)
+        self._column_cache[key] = out
+        return out
+
+    def _format_columns_message(self, tables: list[str]) -> Optional[str]:
+        """Build the user-role payload listing real columns for each requested table."""
+        chunks: list[str] = []
+        for t in tables:
+            cols = self._describe_table(t)
+            if cols:
+                chunks.append(f"dbo.{t}: {cols}")
+            else:
+                chunks.append(f"dbo.{t}: (table not found or no columns visible)")
+        if not chunks:
+            return None
+        return "Actual column lists from INFORMATION_SCHEMA:\n" + "\n".join(chunks)
+
+    def _handle_inspect_request(self, body: str) -> None:
+        """AI asked INSPECT: <tables> — fetch real columns and feed back as a user turn."""
+        # Split out `dbo.Table` tokens from the body
+        tables: list[str] = []
+        for raw in re.split(r"[,;\s]+", body):
+            raw = raw.strip().rstrip(".")
+            if not raw:
+                continue
+            if raw.lower().startswith("dbo."):
+                raw = raw[4:]
+            if _SAFE_IDENT_RE.match(raw) and raw.lower() not in [t.lower() for t in tables]:
+                tables.append(raw)
+        if not tables:
+            self._append_transcript(
+                "assistant",
+                f"<span style='color:{theme.get('warning')}'>INSPECT: requested but no valid table names parsed.</span>",
+            )
+            return
+        if self._inspect_remaining <= 0:
+            self._append_transcript(
+                "assistant",
+                "<i>(INSPECT cap reached for this turn — ignoring further introspection.)</i>",
+            )
+            return
+        self._inspect_remaining -= 1
+        msg = self._format_columns_message(tables)
+        if not msg:
+            self._append_transcript(
+                "assistant",
+                f"<span style='color:{theme.get('warning')}'>INSPECT: no columns returned for {', '.join(tables)}.</span>",
+            )
+            return
+        # Show short confirmation in transcript, full content goes to history
+        self._append_transcript(
+            "assistant",
+            f"<i>🔍 INSPECT: {', '.join('dbo.' + t for t in tables)} — fetching real columns…</i>",
+        )
+        self._history.append({"role": "user", "content": msg})
+        self._append_transcript(
+            "user",
+            f"<i>(auto) sent {sum(c.count(',') + 1 for c in msg.splitlines() if ':' in c)} "
+            "column definitions back to the AI.</i>",
+        )
+        # Re-prompt AI with the new schema info
+        cfg = store.get_ai_config()
+        provider = cfg.get("provider", "anthropic")
+        api_key = cfg.get("api_key", "")
+        model = cfg.get("model") or DEFAULT_MODELS.get(provider, "")
+        sys_prompt = build_system_prompt(
+            store.get_saved_queries(), store.get_ai_notes(),
+        )
+        self._start_worker(provider, api_key, model, sys_prompt,
+                           f"Re-prompting {provider} with real column info…")
 
     # ---- Zero-row interactive diagnostic ---------------------------------
 
@@ -881,7 +993,12 @@ class AITab(QWidget):
             self._set_status(f"⚠ {msg}", "danger")
             if source == "AI":
                 self._set_busy(False)
-                self._request_ai_fix(msg, kind="execution")
+                # If this looks like a column-name mistake, attach the real
+                # columns of every dbo.<table> in the failing SQL so the AI
+                # can self-correct without another round trip.
+                extra = self._build_column_hint_for_error(msg, sql)
+                self._request_ai_fix(msg + ("\n\n" + extra if extra else ""),
+                                     kind="execution")
                 return
         finally:
             self._set_busy(False)
@@ -906,6 +1023,22 @@ class AITab(QWidget):
         self._table.populate(rows)
 
     # ---- Helpers ----------------------------------------------------------
+
+    def _build_column_hint_for_error(self, error_msg: str, sql: str) -> str:
+        """If the SQL Server error is 'Invalid column name X', attach the actual
+        columns of every `dbo.<Table>` referenced in the SQL so the AI can
+        self-correct in one round trip instead of guessing again."""
+        if not _BAD_COLUMN_RE.search(error_msg):
+            return ""
+        seen: list[str] = []
+        for m in _TABLE_REF_RE.finditer(sql):
+            t = m.group(1)
+            if t.lower() not in [s.lower() for s in seen]:
+                seen.append(t)
+        if not seen:
+            return ""
+        msg = self._format_columns_message(seen[:6])  # cap to keep tokens sane
+        return msg or ""
 
     def _set_status(self, msg: str, kind: str = "muted") -> None:
         color_key = {"success": "success", "danger": "danger", "warning": "warning"}.get(kind, "text_muted")

@@ -28,7 +28,11 @@ You output ONE of three things, never combined:
     REMEMBER: <single concise factual sentence, no quotes, no prose around it>
     Save only ONE fact per REMEMBER line. The app will store it persistently and inject it into every future system prompt. After a REMEMBER line, output nothing else (do not also produce SQL in the same turn — wait for the user to re-ask).
 
-After QUESTION:, SQL:, or REMEMBER: lines, output NOTHING ELSE — no explanation, no markdown fences, no prose.
+(D) A schema introspection request. Use this whenever you are uncertain about exact column names, data types, or whether a column exists on a table — instead of guessing and producing a query that errors with "Invalid column name". Format:
+    INSPECT: dbo.<TableName>[, dbo.<TableName2>, ...]
+    The app will reply on the next turn with the actual column list (name + type) for each table you named. Then produce your SQL. Use this LIBERALLY — it costs ~50 tokens and is far cheaper than a failed query + retry. After an INSPECT line, output nothing else.
+
+After QUESTION:, SQL:, REMEMBER:, or INSPECT: lines, output NOTHING ELSE — no explanation, no markdown fences, no prose.
 
 TABLES (dbo schema):
 
