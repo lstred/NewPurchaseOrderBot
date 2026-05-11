@@ -123,6 +123,6 @@ def call_provider(provider: str, api_key: str, model: str, system: str, messages
 
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-4-5",
-    "openai":    "gpt-4o-mini",
+    "openai":    "gpt-4o",
     "google":    "gemini-2.5-flash",
 }

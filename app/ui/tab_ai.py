@@ -52,6 +52,7 @@ from PyQt6.QtWidgets import (
 
 from app.ai.providers import call_provider, AIError, DEFAULT_MODELS
 from app.ai.schema import build_system_prompt
+from app.ai.starter_queries import STARTER_QUERIES, get_chips, get_starter
 from app.data import store
 from app.data.db import read_dataframe
 from app.ui.widgets import DataTable, SectionTitle
@@ -255,6 +256,74 @@ class ParameterDialog(QDialog):
         return {p: f.text().strip() for p, f in self._fields.items()}
 
 
+class LibraryDialog(QDialog):
+    """Browsable catalog of pre-built starter queries.
+
+    Each entry is grouped by category, shows its name + description, and runs
+    instantly against the app's current From/To window. This is how the user
+    gets a guaranteed-correct answer to a canonical question without any LLM
+    round-trip.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("📚 Starter Query Library")
+        self.setMinimumSize(680, 480)
+        self._chosen: Optional[str] = None
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "<b>Pre-built, hand-tested queries</b> — click <b>Run</b> for instant correct results.<br>"
+            f"<span style='color:{theme.get('text_muted')}; font-size:11px;'>"
+            "These bypass the AI entirely and use your top-bar From/To window.</span>"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            f"QListWidget {{ background:{theme.get('bg_card')}; color:{theme.get('text')}; "
+            f"border:1px solid {theme.get('border')}; }}"
+            f"QListWidget::item {{ padding:8px; border-bottom:1px solid {theme.get('border')}; }}"
+            f"QListWidget::item:selected {{ background:{theme.get('accent')}; color:white; }}"
+        )
+        # Group by category with disabled section headers
+        from itertools import groupby
+        items_sorted = sorted(STARTER_QUERIES, key=lambda q: (q["category"], q["name"]))
+        for cat, group in groupby(items_sorted, key=lambda q: q["category"]):
+            header = QListWidgetItem(f"  ── {cat} ──")
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            font = header.font()
+            font.setBold(True)
+            header.setFont(font)
+            self._list.addItem(header)
+            for spec in group:
+                item = QListWidgetItem(f"  {spec['label']}\n     {spec['description']}")
+                item.setData(Qt.ItemDataRole.UserRole, spec["key"])
+                if spec.get("params"):
+                    item.setToolTip("Will prompt for: " + ", ".join("{" + p + "}" for p in spec["params"]))
+                self._list.addItem(item)
+        self._list.itemDoubleClicked.connect(lambda *_: self._accept_with_choice())
+        layout.addWidget(self._list, stretch=1)
+        bb = QDialogButtonBox()
+        run_btn = bb.addButton("▶ Run", QDialogButtonBox.ButtonRole.AcceptRole)
+        run_btn.clicked.connect(self._accept_with_choice)
+        bb.addButton(QDialogButtonBox.StandardButton.Cancel)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def _accept_with_choice(self) -> None:
+        item = self._list.currentItem()
+        if item is None:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if not key:
+            return  # user clicked a section header
+        self._chosen = key
+        self.accept()
+
+    def chosen_key(self) -> Optional[str]:
+        return self._chosen
+
+
 # ---------------------------------------------------------------------------
 # Tab
 # ---------------------------------------------------------------------------
@@ -420,39 +489,37 @@ class AITab(QWidget):
         chip_row.addWidget(QLabel(
             f"<span style='color:{theme.get('text_muted')}; font-size:11px;'>Try:</span>"
         ))
-        chip_specs = [
-            ("📊 Top 20 SKUs by sales last 90 days",
-             "top 20 SKUs by sales last 90 days"),
-            ("📦 Open POs for cost center 010 due this month",
-             "open POs for cost center 010 due this month"),
-            ("🔥 SKUs with Days of Inv (Proj) > 275 launched over 6 months ago",
-             "show me SKUs with Days of Inv (Proj) over 275 that have a launch date over 6 months ago"),
-            ("⚠️ Stockouts with active sales",
-             "show me SKUs that are stocked out but had sales in the last 90 days"),
-            ("🔄 Top 10 SKUs by stock turn YTD",
-             "top 10 SKUs by stock turn year to date"),
-        ]
-        for label, prompt in chip_specs:
-            chip = QPushButton(label)
-            chip.setObjectName("flat")
+        chip_style = (
+            f"QPushButton#chip {{"
+            f"  background:{theme.get('bg_card')};"
+            f"  color:{theme.get('text')};"
+            f"  border:1px solid {theme.get('border')};"
+            f"  border-radius:12px;"
+            f"  padding:4px 10px;"
+            f"  font-size:11px;"
+            f"}}"
+            f"QPushButton#chip:hover {{"
+            f"  background:{theme.get('bg')};"
+            f"  border-color:{theme.get('accent')};"
+            f"  color:{theme.get('accent')};"
+            f"}}"
+        )
+        for spec in get_chips():
+            chip = QPushButton(spec["label"])
+            chip.setObjectName("chip")
             chip.setCursor(Qt.CursorShape.PointingHandCursor)
-            chip.setStyleSheet(
-                f"QPushButton#flat {{"
-                f"  background:{theme.get('bg_card')};"
-                f"  color:{theme.get('text')};"
-                f"  border:1px solid {theme.get('border')};"
-                f"  border-radius:12px;"
-                f"  padding:4px 10px;"
-                f"  font-size:11px;"
-                f"}}"
-                f"QPushButton#flat:hover {{"
-                f"  background:{theme.get('bg')};"
-                f"  border-color:{theme.get('accent')};"
-                f"  color:{theme.get('accent')};"
-                f"}}"
-            )
-            chip.clicked.connect(lambda _, p=prompt: self._apply_suggestion(p))
+            chip.setStyleSheet(chip_style)
+            chip.setToolTip(spec["description"] + "\n\nClick to run instantly (uses your top-bar From/To window).")
+            chip.clicked.connect(lambda _, k=spec["key"]: self._run_starter(k))
             chip_row.addWidget(chip)
+        # Library button — opens a browsable catalog of all starter queries
+        lib_btn = QPushButton("📚 Library…")
+        lib_btn.setObjectName("chip")
+        lib_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        lib_btn.setStyleSheet(chip_style)
+        lib_btn.setToolTip("Browse all pre-built starter queries")
+        lib_btn.clicked.connect(self._open_library)
+        chip_row.addWidget(lib_btn)
         chip_row.addStretch(1)
         ml.addLayout(chip_row)
 
@@ -1069,10 +1136,66 @@ class AITab(QWidget):
         self._sql_from_ai = False
 
     def _apply_suggestion(self, prompt: str) -> None:
-        """Suggestion chip clicked — drop the prompt into the input and focus it."""
+        """Drop a free-text prompt into the input and focus it (sends to AI on Enter)."""
         self._input.setText(prompt)
         self._input.setFocus()
         self._input.setCursorPosition(len(prompt))
+
+    # ---- Starter library (pre-baked, AI-free) -----------------------------
+
+    def _resolve_starter_sql(self, spec: dict) -> Optional[str]:
+        """Substitute {from}/{to} from the app window and prompt for any extra
+        params. Returns the executable SQL, or None if the user cancelled.
+        """
+        sql = spec["sql"]
+        win = self._get_app_window()
+        if win is not None:
+            f, t = win
+            sql = sql.replace("{from}", f.isoformat()).replace("{to}", t.isoformat())
+        else:
+            sql = sql.replace("{from}", "2025-08-05").replace("{to}", date.today().isoformat())
+        # Prompt for any remaining named params (e.g. {cc})
+        remaining = find_parameters(sql)
+        if remaining:
+            dlg = ParameterDialog(remaining, self._param_defaults, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return None
+            values = dlg.values()
+            self._param_defaults.update(values)
+            sql = apply_parameters(sql, values)
+        return sql
+
+    def _run_starter(self, key: str) -> None:
+        """Chip / Library click — execute a hand-tested starter query directly.
+
+        No AI round-trip: SQL has been validated against the actual schema and
+        follows the LEFT-JOIN-from-sku-base pattern, so results are
+        deterministic and instant. The user can still hit Save Query to add
+        their own variant to the sidebar.
+        """
+        spec = get_starter(key)
+        if spec is None:
+            return
+        sql = self._resolve_starter_sql(spec)
+        if sql is None:
+            return
+        self._sql_view.blockSignals(True)
+        self._sql_view.setPlainText(sql)
+        self._sql_view.blockSignals(False)
+        self._sql_from_ai = False
+        self._append_transcript(
+            "user",
+            f"<i>⚡ Starter: <b>{_escape_html(spec['name'])}</b></i>",
+        )
+        self._execute_sql(sql, source=f"starter: {spec['name']}")
+
+    def _open_library(self) -> None:
+        """Open the browsable Starter Library dialog."""
+        dlg = LibraryDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            chosen = dlg.chosen_key()
+            if chosen:
+                self._run_starter(chosen)
 
     def _get_app_window(self) -> Optional[tuple[date, date]]:
         """Walk the parent chain to find the main window's From/To date pickers.
@@ -1120,6 +1243,20 @@ class AITab(QWidget):
             if source == "AI":
                 self._request_ai_fix(err, kind="validation")
             return
+        # Pre-execution: catch obviously-wrong table names BEFORE hitting the
+        # DB. Saves a round-trip and an ugly red error blob for the user.
+        if source == "AI":
+            missing = self._find_missing_tables(sql)
+            if missing:
+                msg = (
+                    "Pre-execution check: the SQL references "
+                    f"{', '.join('dbo.' + t for t in missing)} but those tables do not exist "
+                    "in the database. Use the schema list in the system prompt or emit "
+                    "INSPECT for the correct table name."
+                )
+                self._set_status("⚠ Unknown table in generated SQL — asking AI to fix.", "warning")
+                self._request_ai_fix(msg, kind="validation")
+                return
         self._set_busy(True, f"Running query ({source})…")
         try:
             df = read_dataframe(sql)
@@ -1166,6 +1303,33 @@ class AITab(QWidget):
         self._table.populate(rows)
 
     # ---- Helpers ----------------------------------------------------------
+
+    def _find_missing_tables(self, sql: str) -> list[str]:
+        """Return any `dbo.<Table>` references in the SQL that don't exist in
+        INFORMATION_SCHEMA. Cached per session to keep cost negligible.
+        """
+        seen: list[str] = []
+        for m in _TABLE_REF_RE.finditer(sql):
+            t = m.group(1)
+            if t.lower() not in [s.lower() for s in seen]:
+                seen.append(t)
+        if not seen:
+            return []
+        missing: list[str] = []
+        for t in seen:
+            if not _SAFE_IDENT_RE.match(t):
+                continue
+            cached = self._column_cache.get(t.lower())
+            if cached == "__missing__":
+                missing.append(t)
+                continue
+            if cached:
+                continue  # known to exist
+            cols = self._describe_table(t)
+            if cols is None:
+                self._column_cache[t.lower()] = "__missing__"
+                missing.append(t)
+        return missing
 
     def _build_column_hint_for_error(self, error_msg: str, sql: str) -> str:
         """If the SQL Server error is 'Invalid column name X', attach the actual
