@@ -4,18 +4,47 @@ Reusable widget components shared across tabs.
 
 from __future__ import annotations
 
+import csv
+import os
 import re
+import sys
+import tempfile
+from datetime import datetime
 from typing import Callable, Optional
 
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtGui import QFont, QColor, QAction
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
     QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QLineEdit, QCheckBox, QScrollArea, QGroupBox,
+    QMenu, QFileDialog, QMessageBox, QApplication,
 )
 
 import app.ui.theme as theme
+
+
+_NUM_RE = re.compile(r"^-?\d{1,3}(,\d{3})*(\.\d+)?$|^-?\d+(\.\d+)?$")
+
+
+def _coerce_excel_value(s):
+    """Convert a stringified cell back to int/float when it looks numeric so
+    Excel sorts/aggregates work natively. Leaves text and special markers
+    (e.g. '—', '∞') untouched."""
+    if not isinstance(s, str):
+        return s
+    raw = s.strip()
+    if not raw or raw in ("—", "-", "∞", "N/A"):
+        return raw
+    if _NUM_RE.match(raw):
+        try:
+            cleaned = raw.replace(",", "")
+            if "." in cleaned:
+                return float(cleaned)
+            return int(cleaned)
+        except ValueError:
+            return s
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +233,175 @@ class DataTable(QTableWidget):
             self.horizontalHeader().sectionResized.connect(
                 lambda *_: self._width_timer.start()
             )
+
+        # Right-click context menu: Open in Excel / Export / Copy
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
+    # ------------------------------------------------------------------
+    # Export / Open in Excel
+    # ------------------------------------------------------------------
+
+    def _show_context_menu(self, pos) -> None:
+        menu = QMenu(self)
+        act_open = QAction("📊  Open in Excel", self)
+        act_open.triggered.connect(self._open_in_excel)
+        act_xlsx = QAction("💾  Export to Excel…", self)
+        act_xlsx.triggered.connect(self._export_excel)
+        act_csv = QAction("📄  Export to CSV…", self)
+        act_csv.triggered.connect(self._export_csv)
+        act_copy = QAction("📋  Copy selection", self)
+        act_copy.setShortcut("Ctrl+C")
+        act_copy.triggered.connect(self._copy_selection)
+        menu.addAction(act_open)
+        menu.addSeparator()
+        menu.addAction(act_xlsx)
+        menu.addAction(act_csv)
+        menu.addSeparator()
+        menu.addAction(act_copy)
+        if self.rowCount() == 0:
+            for a in (act_open, act_xlsx, act_csv):
+                a.setEnabled(False)
+        menu.exec(self.viewport().mapToGlobal(pos))
+
+    def _visible_columns(self) -> list[int]:
+        return [i for i in range(self.columnCount()) if not self.isColumnHidden(i)]
+
+    def _table_snapshot(self) -> tuple[list[str], list[list[str]]]:
+        """Capture currently visible columns + sorted rows as plain strings."""
+        cols_idx = self._visible_columns()
+        headers = [self._column_names[i] for i in cols_idx]
+        rows: list[list[str]] = []
+        for r in range(self.rowCount()):
+            if self.isRowHidden(r):
+                continue
+            row: list[str] = []
+            for i in cols_idx:
+                it = self.item(r, i)
+                row.append(it.text() if it is not None else "")
+            rows.append(row)
+        return headers, rows
+
+    def _default_export_name(self, ext: str) -> str:
+        stem = (self._table_id or "table").replace("/", "_")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{stem}_{ts}.{ext}"
+
+    def _write_xlsx(self, path: str) -> None:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        headers, rows = self._table_snapshot()
+        wb = Workbook()
+        ws = wb.active
+        ws.title = (self._table_id or "Data")[:31]
+        ws.append(headers)
+        head_fill = PatternFill("solid", fgColor="1F2937")
+        head_font = Font(bold=True, color="FFFFFF")
+        for cell in ws[1]:
+            cell.fill = head_fill
+            cell.font = head_font
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+        for r in rows:
+            ws.append([_coerce_excel_value(v) for v in r])
+        ws.freeze_panes = "A2"
+        # Auto-size columns (cap at 60 to keep widths sane)
+        for col_idx, h in enumerate(headers, start=1):
+            max_len = len(str(h))
+            for r in rows:
+                if col_idx - 1 < len(r):
+                    cell_len = len(str(r[col_idx - 1]))
+                    if cell_len > max_len:
+                        max_len = cell_len
+            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 60)
+        wb.save(path)
+
+    def _write_csv(self, path: str) -> None:
+        headers, rows = self._table_snapshot()
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            w.writerows(rows)
+
+    def _open_in_excel(self) -> None:
+        if self.rowCount() == 0:
+            return
+        try:
+            tmp_dir = tempfile.gettempdir()
+            stem = (self._table_id or "table").replace("/", "_")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(tmp_dir, f"{stem}_{ts}.xlsx")
+            try:
+                self._write_xlsx(path)
+            except ImportError:
+                # Fallback to CSV if openpyxl missing
+                path = os.path.join(tmp_dir, f"{stem}_{ts}.csv")
+                self._write_csv(path)
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # noqa: S606 — user-initiated
+            elif sys.platform == "darwin":
+                os.system(f'open "{path}"')  # noqa: S605
+            else:
+                os.system(f'xdg-open "{path}"')  # noqa: S605
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "Open in Excel failed", f"{type(e).__name__}: {e}")
+
+    def _export_excel(self) -> None:
+        if self.rowCount() == 0:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export to Excel", self._default_export_name("xlsx"),
+            "Excel Workbook (*.xlsx)",
+        )
+        if not path:
+            return
+        try:
+            self._write_xlsx(path)
+        except ImportError:
+            QMessageBox.warning(
+                self, "openpyxl not installed",
+                "The 'openpyxl' package is required for Excel export.\n\n"
+                "Install it with:  pip install openpyxl\n\n"
+                "Falling back to CSV — try 'Export to CSV…' instead.",
+            )
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "Export failed", f"{type(e).__name__}: {e}")
+
+    def _export_csv(self) -> None:
+        if self.rowCount() == 0:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export to CSV", self._default_export_name("csv"),
+            "CSV file (*.csv)",
+        )
+        if not path:
+            return
+        try:
+            self._write_csv(path)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "Export failed", f"{type(e).__name__}: {e}")
+
+    def _copy_selection(self) -> None:
+        ranges = self.selectedRanges()
+        if not ranges:
+            return
+        rng = ranges[0]
+        lines = []
+        for r in range(rng.topRow(), rng.bottomRow() + 1):
+            cells = []
+            for c in range(rng.leftColumn(), rng.rightColumn() + 1):
+                if self.isColumnHidden(c) or self.isRowHidden(r):
+                    continue
+                it = self.item(r, c)
+                cells.append(it.text() if it is not None else "")
+            lines.append("\t".join(cells))
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        from PyQt6.QtGui import QKeySequence
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self._copy_selection()
+            return
+        super().keyPressEvent(event)
 
     # ------------------------------------------------------------------
     # Dynamic columns (used by AI tab where columns vary per query)

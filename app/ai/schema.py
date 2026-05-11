@@ -231,6 +231,38 @@ Pattern: build per-SKU CTEs (sales, inv, on_order, pending) keyed on base_sku, t
 
 REMINDER: SQL Server has no `to_sy`, `convert_to_sy`, or any custom UoM function. If you write `to_sy(...)` literally in your SQL, the query WILL fail with error 195 ("not a recognized built-in function name"). Always expand the CASE block inline.
 
+APP-DERIVED VARIABLES (NOT raw DB columns — computed in `app/services/metrics_service.py`):
+These appear throughout the UI (Overview, Inventory Timeline, Problem Areas, Daily POs) but have no direct SQL source. Compute them inline. If a user asks for one of these by name, DO NOT search for a column — derive it.
+
+  launch_date              = MIN over (MIN(o.ORDER_ENTRY_DATE) per base_sku, MIN(roll receive date per base_sku)),
+                             then floored at 2025-08-05 so anything older displays as 2025-08-05.
+                             Stored separately in %APPDATA%\PurchaseOrderBot\launch_dates.json once observed,
+                             but for a fresh ad-hoc query just compute the MIN of:
+                                 (a) MIN(TRY_CONVERT(date, CAST(o.ORDER_ENTRY_DATE_YYYYMMDD AS VARCHAR), 112))
+                                     from dbo._ORDERS where [ACCOUNT#I] > 1 AND N_NOT_INVENTORY = 'Y'
+                                 (b) MIN(TRY_CONVERT(date, CAST(r.RLRCTD AS VARCHAR), 112))
+                                     from dbo.ROLLS where Available > 0
+                             grouped by base_sku, then `CASE WHEN result < '2025-08-05' THEN '2025-08-05' ELSE result END`.
+  effective_days           = DATEDIFF(day, GREATEST(launch_date, '{from}'), '{to}') + 1, min 1.
+                             Capped so brand-new SKUs aren't penalised by a long sales window.
+  inventory_age_days       = SUM(roll_qty_sy * (today - r.RLRCTD)) / SUM(roll_qty_sy)  (weighted avg roll age)
+  days_since_last_sale     = DATEDIFF(day, MAX(o.ORDER_ENTRY_DATE), today)  for that sku
+  fill_rate                = SUM(filled_count) / NULLIF(SUM(orders_count), 0)
+                             where filled_count = lines NOT in DETAIL_LINE_STATUS ('B','R')
+  backorder_count          = COUNT lines where DETAIL_LINE_STATUS IN ('B','R')
+  strict_bo_qty_sy         = SUM(qty_sy) where DETAIL_LINE_STATUS IN ('B','R') AND [INVOICE#] = 0
+  is_new (bool)            = (today - launch_date) < 180 days
+  sku_rating (A/B/C/D)     = quartile of orders_count across the result set (A = top 25%, D = bottom 25%)
+  overstock_flag (bool)    = projected_post_receipt > avg_daily * lead_time * 3, where
+                             projected_post_receipt = MAX(inventory_sy - avg_daily*lead_time, 0) + on_order_sy
+                             AND avg_daily > 0 AND inventory_sy > 0 AND NOT is_new
+  excess_order_flag (bool) = same projected formula but threshold = lead_time * 2.5 AND on_order_sy > 0
+  stockout_flag (bool)     = inventory_sy = 0 AND avg_daily_sales_sy > 0
+  stockturn_target         = user-configurable per-scope override (sku: > cc: > pc: > pl: > sup: > global=4.0),
+                             stored in %APPDATA%\PurchaseOrderBot\stockturn_targets.json — not derivable from SQL alone
+
+Style: when an app-derived variable has no DB column, either compute it inline (preferred) or ASK with a QUESTION line if the formula is ambiguous for the user's specific case. Do NOT try to SELECT a non-existent `launch_date` / `is_new` / `fill_rate` column.
+
 ZERO-ROW DIAGNOSTIC PROTOCOL:
 If the user reports the previous query returned 0 rows but they expected results, reply with a SINGLE diagnostic SQL of the form:
   SELECT 'sales' AS step, COUNT(*) AS rows FROM ( <sales CTE body> ) x
