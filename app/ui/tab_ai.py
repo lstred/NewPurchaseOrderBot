@@ -785,6 +785,24 @@ class AITab(QWidget):
 
         if kind == "question":
             self._append_transcript("assistant", _escape_html(body))
+            # If we're already in an auto-retry session and the AI responded
+            # with another QUESTION instead of corrected SQL, that's a stall —
+            # push back once more demanding SQL/INSPECT (uses one more retry slot).
+            if self._auto_retries > 0 and self._auto_retries < self.MAX_AUTO_RETRIES:
+                self._set_status(
+                    "AI asked a question during retry — pushing back for SQL…",
+                    "warning",
+                )
+                self._request_ai_fix(
+                    "You replied with a clarifying question, but during an "
+                    "auto-retry you MUST produce corrected SQL (or INSPECT to "
+                    "verify columns). Use the relative-date windows and the "
+                    "APP-DERIVED VARIABLES / LAUNCH-DATE RELATIVE PHRASING "
+                    "sections in the system prompt to resolve any ambiguity "
+                    "yourself. Reply with SQL or INSPECT now.",
+                    kind="stall",
+                )
+                return
             self._set_status("AI asked a clarifying question — type your answer above.", "muted")
             return
 
@@ -828,6 +846,18 @@ class AITab(QWidget):
 
         # Plain text fallback
         self._append_transcript("assistant", _escape_html(body))
+        # During an auto-retry session, plain prose is also a stall — push back.
+        if self._auto_retries > 0 and self._auto_retries < self.MAX_AUTO_RETRIES:
+            self._set_status(
+                "AI replied with prose during retry — pushing back for SQL…",
+                "warning",
+            )
+            self._request_ai_fix(
+                "You replied with prose, but during an auto-retry you MUST "
+                "produce corrected SQL (or INSPECT to verify columns). No "
+                "explanations. Reply with SQL or INSPECT now.",
+                kind="stall",
+            )
 
     def _on_thread_finished(self) -> None:
         self._thread = None
