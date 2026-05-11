@@ -12,10 +12,11 @@ Database: NRF_REPORTS (Microsoft SQL Server, schema dbo).
 YOUR JOB:
 You output ONE of three things, never combined:
 
-(A) A clarifying question. Use this when the user's request is genuinely ambiguous (unclear which table/column, unclear unit of measure, conflicting filters, etc.). Format:
+(A) A clarifying question. Use this RARELY — only when the user's request is genuinely ambiguous AND no reasonable default exists. PREFER ACTING over asking: pick the most likely interpretation, run the query, and let the user refine. Format:
     QUESTION: <one or two short, specific questions>
     Do NOT guess. Do NOT output SQL after a QUESTION line.
     DO NOT ask for an explicit date range when the user already used a relative phrase like "today", "yesterday", "last 7 days", "last month", "this week", "MTD", "YTD", "this/last quarter", "this/last year", "in May", "in 2026", etc. — RESOLVE those yourself using CURRENT_DATE (see below). Only ask for dates when there is NO date phrasing at all AND the question is inherently time-bounded.
+    DO NOT ask which TABLE to use — use the DEFAULT INTERPRETATION CHEAT-SHEET below. The user expects you to know.
 
 (B) A SQL query. Use this only when you are confident.
     SQL: <the query on the same line or starting on the next line>
@@ -206,7 +207,7 @@ Example — total sales in SY for a window:
 
 COMPUTED APP METRICS — these are what the user sees in the Overview / Daily POs / Problem Areas / Inventory Timeline tabs. They are NOT raw DB columns. If the user asks about ANY of them by name (Days of Inv, Days of Inv (Proj), Net Inv, Avg Daily SY/Sales, Total Sales (SY), Stock Turn, Fill Rate, Runout Risk, Inventory Age, etc.), you MUST compute them with the formulas below — DO NOT return the raw lead-time field `i.IDELIV` when the user asked for "Days of Inv".
 
-If the user has not specified a sales-window date range, ASK with a QUESTION line. The app default window is `2025-08-05` → today. Use placeholders `{from}` / `{to}` (ISO `YYYY-MM-DD`) so the saved query can be re-run.
+If the user has not specified a sales-window date range, USE THE APP WINDOW (`{from}` and `{to}` are pre-filled below from the app's top-bar From/To pickers — or fall back to `2025-08-05` → today). NEVER emit `QUESTION:` asking which date range to use — just use the app window.
 
 Per-SKU formulas (group by base_sku = COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber)). `to_sy(...)` below is the macro above — expand it inline, do NOT call it as a function:
   inventory_sy             = SUM( to_sy(r.Available, r.RUM, i.IWIDTH, i.ICCTR) )
@@ -287,6 +288,84 @@ If the user reports the previous query returned 0 rows but they expected results
   UNION ALL SELECT 'on_order',  COUNT(*) FROM ( <oo  CTE body> ) x
   UNION ALL SELECT 'joined',    COUNT(*) FROM ( <full join body> ) x
 Keep it short. Do not explain. The app will run it and feed back the counts; on the NEXT turn propose a corrected query (typically: switch the empty-side INNER JOIN to LEFT JOIN, widen the date window, or fix the join key).
+
+DEFAULT INTERPRETATION CHEAT-SHEET — pick a table & filter, do NOT ask:
+When the user mentions one of these concepts, USE the indicated table+filter without asking. The user already knows what they mean by these terms — they expect you to too.
+
+  "POs"/"orders entered"/"placed" + a date  -> dbo.OPENPO_D (filter on D@DATE if present, else use the OPENPO_D entry-date column you discover via INSPECT). NEVER assume the column name; INSPECT first if uncertain.
+  "open POs"/"pending POs"                  -> dbo.OPENPO_D where d.[D@ACCT]=1 AND d.[D@DEL8]<>'#' AND d.[D@SUPP]<>'001' AND d.[D@REF#]>0
+  "received POs"/"posted receipts"          -> dbo.OPENIV where NREFTY='R'
+  "sales"/"orders shipped"/"customer orders"/"invoices" -> dbo._ORDERS where [ACCOUNT#I]>1 AND N_NOT_INVENTORY='Y'
+  "warehouse POs"                            -> dbo._ORDERS where [ACCOUNT#I]=1
+  "inventory"/"on hand"/"stock"             -> dbo.ROLLS where Available>0 AND RLOC1<>'REM' AND [RCODE@]<>'#' AND [RCODE@] NOT LIKE '%I%'
+  "items"/"SKUs"/"products"/"part numbers"  -> dbo.ITEM where IINVEN='Y' AND LEN(LTRIM(RTRIM(CAST(IDISCD AS VARCHAR))))<2 AND LTRIM(RTRIM(ICCTR)) NOT LIKE '1%'
+  "Days of Inv"/"Days of Inv (Proj)"/"Net Inv"/"Stock Turn"/"Avg Daily SY"/"Total Sales (SY)"/"Fill Rate"/"Runout Risk"/"Inventory Age" -> compute via the COMPUTED APP METRICS formulas above
+  "launch date"/"launched ___"/"new SKUs"/"old SKUs" -> compute via the APP-DERIVED VARIABLES (launch_date) MIN-of-MINs pattern
+  "supplier" / "vendor"                     -> _ORDERS.[SUPPLIER#] for sales lines, OPENPO_D.[D@SUPP] for POs
+  "cost center"/"CC"                        -> i.ICCTR (3-char code, e.g. '010', '015')
+  "manufacturer"/"mfgr"                     -> i.IMFGR (also _ORDERS.[MFGR] / OPENPO_D.[D@MFGR])
+  "product line"/"PL"                       -> i.IPRODL
+  "lead time"                               -> COALESCE(NULLIF(i.IDELIV,0), NULLIF(pl.LDELIV,0), 30)
+  "price"/"list price"                      -> JOIN dbo.PRICE on ITEM.IPRCCD=PRICE.[$PRCCD] WHERE [$LIST#]='LP'
+  "back orders"/"backorders"/"BO"           -> _ORDERS where DETAIL_LINE_STATUS IN ('B','R')
+  "discontinued"                            -> ITEM where LEN(LTRIM(RTRIM(CAST(IDISCD AS VARCHAR))))>=2 (i.e. IDISCD is a real date)
+
+GUIDING PRINCIPLE: When the user says something like "show me POs ordered last month over $10k" \u2014 you have everything you need. POs = OPENPO_D, "last month" = the relative date table, "over $10k" = HAVING SUM(qty*cost) > 10000. Just write the query. If a single SPECIFIC column is uncertain (e.g. which OPENPO_D field holds the entry date), use INSPECT \u2014 don't ask the user.
+
+WORKED EXAMPLES (study the patterns \u2014 your output should look like this):
+
+Example 1 \u2014 user: "top 20 SKUs by sales last 90 days"
+  WITH sku_base AS (
+      SELECT COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber) AS base_sku
+      FROM dbo.ITEM i
+      WHERE i.IINVEN='Y' AND LTRIM(RTRIM(i.ICCTR)) NOT LIKE '1%'
+      GROUP BY COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber)
+  ),
+  sales AS (
+      SELECT COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber) AS base_sku,
+             SUM(<UoM CASE for o.QUANTITY_ORDERED>) AS total_sales_sy
+      FROM dbo._ORDERS o
+      JOIN dbo.ITEM i ON o.ITEM_MFGR_COLOR_PAT = i.ItemNumber
+      WHERE o.[ACCOUNT#I]>1 AND o.N_NOT_INVENTORY='Y'
+        AND o.ORDER_ENTRY_DATE_YYYYMMDD BETWEEN <last90_start> AND <today>   -- from the relative-date table
+      GROUP BY COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber)
+  )
+  SELECT TOP 20 b.base_sku, COALESCE(s.total_sales_sy,0) AS total_sales_sy
+  FROM sku_base b LEFT JOIN sales s ON s.base_sku = b.base_sku
+  ORDER BY COALESCE(s.total_sales_sy,0) DESC
+
+Example 2 \u2014 user: "open POs for cost center 010 due this month"
+  SELECT d.[D@REF#] AS po, LTRIM(RTRIM(d.[D@MFGR]))+LTRIM(RTRIM(d.[D@COLO]))+LTRIM(RTRIM(d.[D@PATT])) AS sku,
+         d.[D@QTYO]-d.[D@QTYP] AS qty_remaining, i.ICCTR AS cc
+  FROM dbo.OPENPO_D d
+  JOIN dbo.ITEM i ON LTRIM(RTRIM(d.[D@MFGR]))+LTRIM(RTRIM(d.[D@COLO]))+LTRIM(RTRIM(d.[D@PATT])) = i.ItemNumber
+  WHERE d.[D@ACCT]=1 AND d.[D@DEL8]<>'#' AND d.[D@SUPP]<>'001' AND d.[D@REF#]>0
+    AND d.[D@QTYO] > d.[D@QTYP]
+    AND LTRIM(RTRIM(i.ICCTR))='010'
+    -- filter the OPENPO_D ETA column for current calendar month (use INSPECT first if uncertain which column)
+  ORDER BY d.[D@REF#] DESC
+
+Example 3 \u2014 user: "POs with Days of Inv (Proj) > 275 placed in last 14 days"
+  WITH sku_base AS (...), sales AS (...), inv AS (...), oo AS (...),
+  metric AS (
+      SELECT b.base_sku,
+             COALESCE(i.inventory_sy,0) AS inv_sy,
+             COALESCE(o.on_order_sy,0) AS oo_sy,
+             COALESCE(s.total_sales_sy,0) / NULLIF(<effective_days>, 0) AS adsy
+      FROM sku_base b
+      LEFT JOIN sales s ON s.base_sku = b.base_sku
+      LEFT JOIN inv   i ON i.base_sku = b.base_sku
+      LEFT JOIN oo    o ON o.base_sku = b.base_sku
+  )
+  SELECT TOP 200 d.[D@REF#] AS po, m.base_sku,
+         (m.inv_sy + m.oo_sy) / NULLIF(m.adsy,0) AS days_of_inv_proj
+  FROM dbo.OPENPO_D d
+  JOIN dbo.ITEM  i  ON LTRIM(RTRIM(d.[D@MFGR]))+LTRIM(RTRIM(d.[D@COLO]))+LTRIM(RTRIM(d.[D@PATT])) = i.ItemNumber
+  JOIN metric    m  ON m.base_sku = COALESCE(NULLIF(LTRIM(RTRIM(i.IIXREF)),''), i.ItemNumber)
+  WHERE d.[D@ACCT]=1 AND d.[D@DEL8]<>'#' AND d.[D@SUPP]<>'001' AND d.[D@REF#]>0
+    -- AND <OPENPO_D entry date column> BETWEEN <last14_start> AND <today>   (INSPECT if uncertain)
+    AND (m.inv_sy + m.oo_sy) / NULLIF(m.adsy,0) > 275
+  ORDER BY days_of_inv_proj DESC
 """
 
 
@@ -358,6 +437,7 @@ def build_system_prompt(
     saved_queries: list[dict] | None = None,
     notes: list[dict] | None = None,
     today: Optional[date] = None,
+    app_window: Optional[tuple[date, date]] = None,
 ) -> str:
     """Build the full system prompt with date context, persistent notes and saved-query library.
 
@@ -369,10 +449,22 @@ def build_system_prompt(
 
     `today` is injected so the AI can resolve relative date phrases ("last 7 days",
     "last month", "MTD", etc.) without asking the user for explicit dates.
+
+    `app_window` is the (from, to) currently selected in the app's top-bar date pickers,
+    injected as `{from}` / `{to}` placeholders the AI can splice into queries — so when
+    the user doesn't specify a window, the AI uses what's on screen instead of asking.
     """
     if today is None:
         today = date.today()
     parts = [SCHEMA_PROMPT, _build_date_context(today)]
+    if app_window is not None:
+        f, t = app_window
+        parts.append(
+            f"\nAPP WORKING WINDOW (from the top-bar date pickers): "
+            f"{{from}} = {f.isoformat()}, {{to}} = {t.isoformat()}. "
+            f"As YYYYMMDD ints: {f.strftime('%Y%m%d')} and {t.strftime('%Y%m%d')}. "
+            "When the user does NOT specify a sales window, USE THIS \u2014 do not ask.\n"
+        )
 
     if notes:
         parts.append("\nUSER PREFERENCES & NOTES (always apply unless the user overrides them in the current turn):")

@@ -25,6 +25,7 @@ are rejected by the validator before any database hit.
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Optional
 
 import pandas as pd
@@ -291,7 +292,24 @@ class AITab(QWidget):
         outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(8)
 
-        outer.addWidget(SectionTitle("🤖  AI Query"))
+        # Futuristic gradient header banner
+        banner = QLabel(
+            "<span style='font-size:18px; font-weight:800; letter-spacing:0.5px;'>✨ AI Query</span>"
+            "<span style='font-size:11px; color:rgba(255,255,255,0.78); margin-left:10px;'>"
+            "Ask in plain English — the AI knows your schema, your metrics, today's date, "
+            "and your top-bar window"
+            "</span>"
+        )
+        banner.setStyleSheet(
+            "QLabel {"
+            "  color: white;"
+            "  padding: 10px 14px;"
+            "  border-radius: 8px;"
+            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            "      stop:0 #6366f1, stop:0.5 #8b5cf6, stop:1 #ec4899);"
+            "}"
+        )
+        outer.addWidget(banner)
 
         # Top-level horizontal splitter: sidebar | main
         h = QSplitter(Qt.Orientation.Horizontal)
@@ -367,37 +385,76 @@ class AITab(QWidget):
         ml.setContentsMargins(0, 0, 0, 0)
         ml.setSpacing(8)
 
-        # Hint
+        # Hint (compact, single line)
         info = QLabel(
-            "Ask in plain English — for example: "
-            "<i>“top 20 SKUs by sales last 90 days”</i> · "
-            "<i>“open POs for cost center 010 due this month”</i>. "
-            "If the AI is unsure it will ask a clarifying question. "
-            "Teach it persistent rules with phrases like "
-            "<i>“remember to exclude supplier 001 when discussing suppliers”</i> — "
-            "saved entries appear in the <b>Memory</b> panel and apply to every future chat."
+            "💡 Type a question below or click a suggestion chip. "
+            "Teach persistent rules with <i>“remember to …”</i> — "
+            "saved entries appear in <b>Memory</b> and apply to every chat."
         )
         info.setWordWrap(True)
-        info.setStyleSheet(f"color:{theme.get('text_muted')};")
+        info.setStyleSheet(f"color:{theme.get('text_muted')}; font-size:11px;")
         ml.addWidget(info)
 
         # Input row
         in_row = QHBoxLayout()
         in_row.setSpacing(6)
         self._input = QLineEdit()
-        self._input.setPlaceholderText("Type your question and press Enter…")
+        self._input.setPlaceholderText("Ask anything about inventory, sales, POs, SKUs…")
         self._input.returnPressed.connect(self._on_send)
-        self._input.setMinimumHeight(34)
-        self._send_btn = QPushButton("Ask")
+        self._input.setMinimumHeight(36)
+        self._send_btn = QPushButton("✨ Ask")
         self._send_btn.clicked.connect(self._on_send)
-        self._send_btn.setMinimumHeight(34)
+        self._send_btn.setMinimumHeight(36)
         self._new_chat_btn = QPushButton("New Chat")
-        self._new_chat_btn.setMinimumHeight(34)
+        self._new_chat_btn.setMinimumHeight(36)
         self._new_chat_btn.clicked.connect(self._on_new_chat)
         in_row.addWidget(self._input, stretch=1)
         in_row.addWidget(self._send_btn)
         in_row.addWidget(self._new_chat_btn)
         ml.addLayout(in_row)
+
+        # Suggestion chips — click to populate the input
+        chip_row = QHBoxLayout()
+        chip_row.setSpacing(6)
+        chip_row.setContentsMargins(0, 2, 0, 0)
+        chip_row.addWidget(QLabel(
+            f"<span style='color:{theme.get('text_muted')}; font-size:11px;'>Try:</span>"
+        ))
+        chip_specs = [
+            ("📊 Top 20 SKUs by sales last 90 days",
+             "top 20 SKUs by sales last 90 days"),
+            ("📦 Open POs for cost center 010 due this month",
+             "open POs for cost center 010 due this month"),
+            ("🔥 SKUs with Days of Inv (Proj) > 275 launched over 6 months ago",
+             "show me SKUs with Days of Inv (Proj) over 275 that have a launch date over 6 months ago"),
+            ("⚠️ Stockouts with active sales",
+             "show me SKUs that are stocked out but had sales in the last 90 days"),
+            ("🔄 Top 10 SKUs by stock turn YTD",
+             "top 10 SKUs by stock turn year to date"),
+        ]
+        for label, prompt in chip_specs:
+            chip = QPushButton(label)
+            chip.setObjectName("flat")
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.setStyleSheet(
+                f"QPushButton#flat {{"
+                f"  background:{theme.get('bg_card')};"
+                f"  color:{theme.get('text')};"
+                f"  border:1px solid {theme.get('border')};"
+                f"  border-radius:12px;"
+                f"  padding:4px 10px;"
+                f"  font-size:11px;"
+                f"}}"
+                f"QPushButton#flat:hover {{"
+                f"  background:{theme.get('bg')};"
+                f"  border-color:{theme.get('accent')};"
+                f"  color:{theme.get('accent')};"
+                f"}}"
+            )
+            chip.clicked.connect(lambda _, p=prompt: self._apply_suggestion(p))
+            chip_row.addWidget(chip)
+        chip_row.addStretch(1)
+        ml.addLayout(chip_row)
 
         # Status label
         self._status = QLabel("")
@@ -708,6 +765,8 @@ class AITab(QWidget):
         sys_prompt = build_system_prompt(
             store.get_saved_queries(),
             store.get_ai_notes(),
+            today=date.today(),
+            app_window=self._get_app_window(),
         )
 
         self._start_worker(provider, api_key, model, sys_prompt, f"Asking {provider}…")
@@ -763,6 +822,8 @@ class AITab(QWidget):
         sys_prompt = build_system_prompt(
             store.get_saved_queries(),
             store.get_ai_notes(),
+            today=date.today(),
+            app_window=self._get_app_window(),
         )
         self._start_worker(provider, api_key, model, sys_prompt,
                            f"Auto-retrying \u2014 asking {provider} to fix the SQL\u2026")
@@ -950,6 +1011,7 @@ class AITab(QWidget):
         model = cfg.get("model") or DEFAULT_MODELS.get(provider, "")
         sys_prompt = build_system_prompt(
             store.get_saved_queries(), store.get_ai_notes(),
+            today=date.today(), app_window=self._get_app_window(),
         )
         self._start_worker(provider, api_key, model, sys_prompt,
                            f"Re-prompting {provider} with real column info…")
@@ -993,6 +1055,7 @@ class AITab(QWidget):
         model = cfg.get("model") or DEFAULT_MODELS.get(provider, "")
         sys_prompt = build_system_prompt(
             store.get_saved_queries(), store.get_ai_notes(),
+            today=date.today(), app_window=self._get_app_window(),
         )
         self._start_worker(provider, api_key, model, sys_prompt,
                            f"Diagnosing zero-row result with {provider}…")
@@ -1004,6 +1067,32 @@ class AITab(QWidget):
         treats this as user-authored SQL (no auto-fix loop on errors).
         """
         self._sql_from_ai = False
+
+    def _apply_suggestion(self, prompt: str) -> None:
+        """Suggestion chip clicked — drop the prompt into the input and focus it."""
+        self._input.setText(prompt)
+        self._input.setFocus()
+        self._input.setCursorPosition(len(prompt))
+
+    def _get_app_window(self) -> Optional[tuple[date, date]]:
+        """Walk the parent chain to find the main window's From/To date pickers.
+
+        Returns (from, to) as `date` objects, or None if not found / invalid.
+        Used to inject the user's current working window into the AI system
+        prompt so the AI never has to ask "what date range?".
+        """
+        w = self.window()
+        ds = getattr(w, "_date_start", None)
+        de = getattr(w, "_date_end", None)
+        if ds is None or de is None:
+            return None
+        try:
+            qs = ds.date()
+            qe = de.date()
+            return (date(qs.year(), qs.month(), qs.day()),
+                    date(qe.year(), qe.month(), qe.day()))
+        except Exception:
+            return None
 
     def _on_run_manual(self) -> None:
         sql = self._sql_view.toPlainText().strip()
