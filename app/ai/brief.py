@@ -407,13 +407,16 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
     # Items with very large combined exposure (inventory + on order) AND multi-year
     # cover.  Surfaced unconditionally at high severity so they never lose the
     # top-concerns ranking battle to many smaller higher-severity items.
+    # Thresholds intentionally permissive — the goal is to never miss a real
+    # cash-on-the-floor problem.  Final ranking is by exposure_sy, so even
+    # marginal threshold hits sort below the truly massive items.
     mo = sm.copy()
     exposure = mo["inventory_sy"].fillna(0) + mo["on_order_sy"].fillna(0)
     doi_proj = mo["days_of_inventory_projected"].replace([float("inf"), float("-inf")], 99999).fillna(99999)
     avg_daily = mo["avg_daily_sales_sy"].fillna(0)
-    big_exposure = exposure >= 5000  # SY threshold
-    multi_year_cover = doi_proj >= 730  # ~2 years
-    dead_with_inbound = (avg_daily <= 0) & (mo["on_order_sy"].fillna(0) > 1000)
+    big_exposure = exposure >= 3000  # SY threshold (lowered from 5000)
+    multi_year_cover = doi_proj >= 540  # 18 months (lowered from 730)
+    dead_with_inbound = (avg_daily <= 0) & (mo["on_order_sy"].fillna(0) > 500)
     mo_mask = big_exposure & (multi_year_cover | dead_with_inbound)
     mo = mo[mo_mask].copy()
     if not mo.empty:
@@ -421,7 +424,8 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         mo["days_of_inventory_projected"] = mo["days_of_inventory_projected"].replace(
             [float("inf"), float("-inf")], None
         )
-        mo = mo.sort_values("exposure_sy", ascending=False).head(20)[
+        # Top 40 portfolio-wide so big positions in mid-tier CCs aren't starved
+        mo = mo.sort_values("exposure_sy", ascending=False).head(40)[
             ["sku", "sku_description", "inventory_sy", "on_order_sy", "exposure_sy",
              "avg_daily_sales_sy", "days_of_inventory", "days_of_inventory_projected",
              "inventory_age_days", "supplier_number", "price_class_desc", "cost_center"]
@@ -723,13 +727,28 @@ def _concern_rows(data: BriefData) -> pd.DataFrame:
 
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+
+    # Dynamic severity boost for massive_overstock by exposure (v4.6) ---------
+    # A 50,000-SY cash position is more urgent than a 27-SY late-PO miss, but
+    # the static severity table doesn't know that.  Boost massive_overstock
+    # rows above po_late (100) when exposure is genuinely large.
+    df["severity"] = df["severity"].astype("float64")
+    mo_mask = df["concern"] == "massive_overstock"
+    if mo_mask.any():
+        # +0 at 5k exposure, +5 at 20k, +10 at 50k, +15 at 100k+ — monotonic.
+        boost = (df.loc[mo_mask, "impact"].clip(lower=0) / 10000.0).clip(upper=15.0)
+        df.loc[mo_mask, "severity"] = df.loc[mo_mask, "severity"] + boost
+    return df
 
 
-def _build_top_concerns(data: BriefData, sm: pd.DataFrame, top_n: int = 18) -> pd.DataFrame:
+def _build_top_concerns(data: BriefData, sm: pd.DataFrame, top_n: int = 25) -> pd.DataFrame:
     """Pick the top-N most-urgent SKU/concern combinations across the portfolio.
 
-    Within a severity tier we prefer larger inventory or larger demand impact.
+    Diversity quota: no single concern type may consume more than 6 slots.
+    Within a tier we prefer higher impact and larger inventory.  This stops one
+    noisy concern (e.g. 15 small `po_late` items) from crowding out genuine
+    high-impact items of other types.
     """
     df = _concern_rows(data)
     if df.empty:
@@ -739,6 +758,11 @@ def _build_top_concerns(data: BriefData, sm: pd.DataFrame, top_n: int = 18) -> p
     )
     # Dedup so a single SKU only shows once at the top — keep its top concern.
     df = df.drop_duplicates(subset=["sku"], keep="first")
+
+    # Diversity cap: at most _MAX_PER_CONCERN per concern type in the leader board
+    _MAX_PER_CONCERN = 6
+    df["_rank_in_kind"] = df.groupby("concern").cumcount()
+    df = df[df["_rank_in_kind"] < _MAX_PER_CONCERN].drop(columns="_rank_in_kind")
     return df.head(top_n).reset_index(drop=True)
 
 
@@ -907,7 +931,7 @@ def build_brief_prompt(data: BriefData) -> str:
         "These are the highest-severity SKU/issue combinations across the entire eligible\n"
         "portfolio. Severity-tiered then ranked by impact. Each row already includes a\n"
         "specific recommended action — quote it verbatim or refine.\n\n"
-        + _df_to_compact_table(data.top_concerns, max_rows=18)
+        + _df_to_compact_table(data.top_concerns, max_rows=25)
     )
 
     # --- Yesterday's activity ----------------------------------------------------

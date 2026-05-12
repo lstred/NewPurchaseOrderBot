@@ -83,11 +83,13 @@ DO NOT write aggregate counts like "we have 600 stockouts" or "many SKUs are
 overstocked". Those are useless. Name the specific SKUs and specific actions.
 
 MANDATORY MASSIVE-OVERSTOCK COVERAGE: every row in the data's `MASSIVE OVERSTOCK`
-table represents a very large cash position (5,000+ SY combined, multi-year cover
-or dead-with-inbound). At least one bullet in Top Concerns MUST address each of
-the top 3 rows of that table when present, even if other concerns rank above
-them numerically. These are the largest dollar exposures in the portfolio and
-must never be silently skipped.
+table represents a very large cash position (3,000+ SY combined, 18+ months of
+cover or dead-with-inbound). At least one bullet in Top Concerns MUST address
+each of the top 5 rows of that table when present, even if other concerns rank
+above them numerically. Furthermore, EVERY cost center section that has a
+`massive_overstock` table MUST address its top 5 rows with explicit
+[CANCEL]/[DEFER]/[CLEARANCE] bullets — these are the largest dollar exposures
+in each CC and must never be silently skipped.
 
 ## Yesterday's Notable Changes
 Only call out yesterday's POs / receipts / backorders / sales that meaningfully
@@ -100,10 +102,14 @@ Concerns appears here with its full local context — plus any CC-specific
 issues that didn't make the portfolio-wide top.)"*
 
 For each cost center listed in the PER-COST-CENTER BREAKDOWN section of the
-data, render a `## CC <code> — <name>` heading FOLLOWED by 2-6 specific,
+data, render a `## CC <code> — <name>` heading FOLLOWED by 5-12 specific,
 actionable bullets drawn from THAT cost center's tables. Each bullet follows
 the same format as Top Concerns (specific SKU, what's wrong, what to do, why)
 but WITHOUT the [CC xxx] prefix (the section heading already states the CC).
+Aim for THOROUGH coverage — a buyer expects to see every meaningful issue in
+their CC, not a sampler. If a CC's tables hold 8+ distinct actionable items,
+write 8+ bullets. Never artificially cap a CC at 3-4 bullets when the data
+shows more.
 
 MANDATORY: every cost center that appears in any Top Concern bullet MUST have
 its own section here — never leave a CC mentioned at the top with no section
@@ -113,10 +119,11 @@ If a CC has zero actionable bullets to write AND it doesn't appear in Top
 Concerns, OMIT THE ENTIRE SECTION. Empty headings = clutter.
 
 Within each CC section, group bullets logically (Stockout Watch / Overstock &
-Aging / Recommended Actions) only if there are 4+ bullets — otherwise just a
+Aging / Recommended Actions) only if there are 6+ bullets — otherwise just a
 flat list is cleaner. Pay particular attention to **NEEDS REORDER** items in
-the data (active demand, zero open PO, short cover) — these are buys the
-team should be placing today.
+the data (active demand, zero open PO, short cover) AND the per-CC
+**massive_overstock** table (largest cash positions in that CC) — the buyer
+must see explicit action on both.
 
 ## Recommended Actions (top 5)
 Numbered list (real Markdown, ONE item per line beginning with `1. `, `2. `,
