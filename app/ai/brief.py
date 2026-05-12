@@ -92,6 +92,10 @@ class BriefData:
     # Open POs grossly oversized vs trailing 90-day demand (catches slow/dead
     # movers that the overstock_flag/avg_daily filter can miss).
     oversized_pos_vs_demand: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Massive cash-on-floor overstock — items with very large combined inventory
+    # + on_order AND multi-year cover.  Surfaced unconditionally so high-impact
+    # items never lose the top-concerns ranking battle to many smaller items.
+    massive_overstock: pd.DataFrame = field(default_factory=pd.DataFrame)
     # Per-cost-center breakdown — only CCs with at least one concern populated
     # Shape: { cc_code: { 'name': str, 'kpis': dict, 'tables': { table_name: DataFrame } } }
     cost_center_problems: dict = field(default_factory=dict)
@@ -324,6 +328,10 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
     # ------------------------------ Overstock with open PO ------------------------------
     # Items where today's stock is already overstock AND there is an open PO that
     # will make it worse — directly actionable (cancel/defer the PO).
+    # NOTE: avg_daily_sales_sy > 0 gate intentionally relaxed — items with zero
+    # current velocity but huge open POs are caught by `oversized_pos_vs_demand`
+    # and `massive_overstock` instead, but we keep the gate here so this table
+    # stays focused on items that *do* sell.
     ov = sm[
         sm["overstock_flag"] & (sm["on_order_sy"] > 0) & (sm["avg_daily_sales_sy"] > 0)
     ].copy()
@@ -331,7 +339,10 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         ov["days_of_inventory_projected"] = ov["days_of_inventory_projected"].replace(
             [float("inf"), float("-inf")], None
         )
-        ov = ov.sort_values("days_of_inventory_projected", ascending=False).head(30)[
+        # Sort by cash exposure first (inv + on_order), then DOI_proj — so the
+        # biggest cash positions never get cut by the head(30) cap.
+        ov["_exposure"] = ov["inventory_sy"].fillna(0) + ov["on_order_sy"].fillna(0)
+        ov = ov.sort_values(["_exposure", "days_of_inventory_projected"], ascending=[False, False]).head(30)[
             ["sku", "sku_description", "inventory_sy", "on_order_sy",
              "avg_daily_sales_sy", "days_of_inventory", "days_of_inventory_projected",
              "stockturn_target", "supplier_number", "price_class_desc", "cost_center"]
@@ -362,7 +373,9 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         inc["days_of_inventory_projected"] = inc["days_of_inventory_projected"].replace(
             [float("inf"), float("-inf")], 9999
         )
-        inc = inc.sort_values("days_of_inventory_projected", ascending=False).head(30)[
+        # Same exposure-first sort as overstock_with_open_po so big cash items lead.
+        inc["_exposure"] = inc["inventory_sy"].fillna(0) + inc["on_order_sy"].fillna(0)
+        inc = inc.sort_values(["_exposure", "days_of_inventory_projected"], ascending=[False, False]).head(30)[
             ["sku", "sku_description", "inventory_sy", "on_order_sy",
              "avg_daily_sales_sy", "days_of_inventory_projected", "supplier_number",
              "price_class_desc", "cost_center"]
@@ -389,6 +402,31 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         "twelve_month_doi_skus": twelve_mo_skus,
         "aging_365d_skus":   aging_skus,
     }
+
+    # ------------------------------ Massive overstock (v4.5) ------------------------------
+    # Items with very large combined exposure (inventory + on order) AND multi-year
+    # cover.  Surfaced unconditionally at high severity so they never lose the
+    # top-concerns ranking battle to many smaller higher-severity items.
+    mo = sm.copy()
+    exposure = mo["inventory_sy"].fillna(0) + mo["on_order_sy"].fillna(0)
+    doi_proj = mo["days_of_inventory_projected"].replace([float("inf"), float("-inf")], 99999).fillna(99999)
+    avg_daily = mo["avg_daily_sales_sy"].fillna(0)
+    big_exposure = exposure >= 5000  # SY threshold
+    multi_year_cover = doi_proj >= 730  # ~2 years
+    dead_with_inbound = (avg_daily <= 0) & (mo["on_order_sy"].fillna(0) > 1000)
+    mo_mask = big_exposure & (multi_year_cover | dead_with_inbound)
+    mo = mo[mo_mask].copy()
+    if not mo.empty:
+        mo["exposure_sy"] = exposure[mo_mask]
+        mo["days_of_inventory_projected"] = mo["days_of_inventory_projected"].replace(
+            [float("inf"), float("-inf")], None
+        )
+        mo = mo.sort_values("exposure_sy", ascending=False).head(20)[
+            ["sku", "sku_description", "inventory_sy", "on_order_sy", "exposure_sy",
+             "avg_daily_sales_sy", "days_of_inventory", "days_of_inventory_projected",
+             "inventory_age_days", "supplier_number", "price_class_desc", "cost_center"]
+        ]
+        data.massive_overstock = mo
 
     # ------------------------------ NEW v4.2 actionable metrics ------------------------------
     _build_actionable_metrics(data, sm, bundle, target_date)
@@ -587,7 +625,7 @@ def _build_actionable_metrics(
                 # Sort: zero-demand POs first (worst), then by largest PO.
                 op["_no_demand"] = (op["sales_90d"] <= 0).astype(int)
                 op = op.sort_values(["_no_demand", "on_order_sy"], ascending=[False, False]).head(20)
-                op["po_months_of_demand"] = op["po_months_of_demand"].fillna(9999).round(1)
+                op["po_months_of_demand"] = pd.to_numeric(op["po_months_of_demand"], errors="coerce").fillna(9999.0).round(1)
                 data.oversized_pos_vs_demand = op[
                     ["sku", "sku_description", "inventory_sy", "on_order_sy",
                      "sales_90d", "po_months_of_demand", "avg_daily_sales_sy",
@@ -603,6 +641,7 @@ def _build_actionable_metrics(
 _CONCERN_SEVERITY = {
     "po_late":            100,  # PO arriving after stockout — direct lost sales
     "redflag_new_po":      95,  # buyer entered a PO yesterday that worsens overstock
+    "massive_overstock":   92,  # huge cash on the floor + multi-year cover (v4.5)
     "stockout":            90,  # zero stock + real demand
     "needs_reorder":       88,  # has demand, no PO on the books — buyer must act
     "receipt_to_overstock":85,
@@ -655,6 +694,9 @@ def _concern_rows(data: BriefData) -> pd.DataFrame:
     _emit(data.redflag_new_pos, "redflag_new_po",
           "Review/cancel PO entered yesterday — it worsens an already-overstocked SKU.",
           impact_col="qty_native")
+    _emit(data.massive_overstock, "massive_overstock",
+          "Freeze inbound + open clearance plan — massive cash on the floor with multi-year cover.",
+          impact_col="exposure_sy")
     _emit(data.active_stockouts, "stockout",
           "Place a PO immediately — zero stock with active demand.",
           impact_col="avg_daily_sales_sy")
@@ -684,7 +726,7 @@ def _concern_rows(data: BriefData) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _build_top_concerns(data: BriefData, sm: pd.DataFrame, top_n: int = 12) -> pd.DataFrame:
+def _build_top_concerns(data: BriefData, sm: pd.DataFrame, top_n: int = 18) -> pd.DataFrame:
     """Pick the top-N most-urgent SKU/concern combinations across the portfolio.
 
     Within a severity tier we prefer larger inventory or larger demand impact.
@@ -714,6 +756,7 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
             cc_name_lookup[str(cc)] = str(name or "")
 
     table_specs = [
+        ("massive_overstock",       data.massive_overstock),
         ("active_stockouts",        data.active_stockouts),
         ("runout_risk",             data.runout_risk),
         ("overstock_with_open_po",  data.overstock_with_open_po),
@@ -738,7 +781,45 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
                 "tables": {},
                 "kpis":   {},
             })
-            slot["tables"][name] = sub.head(10).reset_index(drop=True)
+            slot["tables"][name] = sub.head(15).reset_index(drop=True)
+
+    # Per-CC massive overstock overlay (v4.5) -------------------------------
+    # The global `data.massive_overstock` is capped at 20 portfolio-wide, which
+    # can starve mid-tier CCs of their own biggest items. Here we compute a
+    # CC-local top-15 directly from sm so every CC's heaviest cash positions
+    # surface in the per-CC section even if they don't crack the global top.
+    if cc_col in sm.columns:
+        sm_local = sm.copy()
+        exposure = sm_local["inventory_sy"].fillna(0) + sm_local["on_order_sy"].fillna(0)
+        doi_proj = sm_local["days_of_inventory_projected"].replace(
+            [float("inf"), float("-inf")], 99999
+        ).fillna(99999)
+        avg_daily = sm_local["avg_daily_sales_sy"].fillna(0)
+        # Slightly lower thresholds at the per-CC level so smaller CCs still
+        # get their top items called out.
+        mask_local = (
+            (exposure >= 3000)
+            & ((doi_proj >= 540) | ((avg_daily <= 0) & (sm_local["on_order_sy"].fillna(0) > 500)))
+        )
+        local = sm_local[mask_local].copy()
+        if not local.empty:
+            local["exposure_sy"] = exposure[mask_local]
+            local["days_of_inventory_projected"] = local["days_of_inventory_projected"].replace(
+                [float("inf"), float("-inf")], None
+            )
+            cols = ["sku", "sku_description", "inventory_sy", "on_order_sy", "exposure_sy",
+                    "avg_daily_sales_sy", "days_of_inventory", "days_of_inventory_projected",
+                    "inventory_age_days", "supplier_number", "price_class_desc", "cost_center"]
+            cols = [c for c in cols if c in local.columns]
+            for cc, sub in local[cols].groupby(cc_col):
+                cc_str = str(cc or "").strip() or "(unassigned)"
+                if cc_str not in out:
+                    continue  # only attach to CCs that already have other concerns
+                top_local = sub.sort_values("exposure_sy", ascending=False).head(15).reset_index(drop=True)
+                # Don't shadow the global table if it's already richer than the local one
+                existing = out[cc_str]["tables"].get("massive_overstock")
+                if existing is None or len(top_local) > len(existing):
+                    out[cc_str]["tables"]["massive_overstock"] = top_local
 
     # Per-CC quick KPIs (computed on full eligible sm, not just problem tables)
     if cc_col in sm.columns:
@@ -826,7 +907,7 @@ def build_brief_prompt(data: BriefData) -> str:
         "These are the highest-severity SKU/issue combinations across the entire eligible\n"
         "portfolio. Severity-tiered then ranked by impact. Each row already includes a\n"
         "specific recommended action — quote it verbatim or refine.\n\n"
-        + _df_to_compact_table(data.top_concerns, max_rows=12)
+        + _df_to_compact_table(data.top_concerns, max_rows=18)
     )
 
     # --- Yesterday's activity ----------------------------------------------------
@@ -902,6 +983,13 @@ def build_brief_prompt(data: BriefData) -> str:
                     + _df_to_compact_table(data.runout_risk))
     sections.append("\n## OVERSTOCK WITH OPEN PO (PO will make it worse)\n"
                     + _df_to_compact_table(data.overstock_with_open_po))
+    sections.append("\n## MASSIVE OVERSTOCK (very large cash on the floor + multi-year cover)\n"
+                    "These are the highest-dollar overstock positions in the portfolio.\n"
+                    "`exposure_sy` = inventory_sy + on_order_sy. Items either have 2+ years of\n"
+                    "projected cover OR have an inbound PO with no current sales velocity. Every\n"
+                    "row here is a candidate for [CANCEL]/[DEFER] of inbound + [CLEARANCE] of\n"
+                    "on-hand stock. DO NOT skip these in the brief — they are priority #1 hits.\n\n"
+                    + _df_to_compact_table(data.massive_overstock))
     sections.append("\n## AGING INVENTORY (rolls >= 365 days old)\n"
                     + _df_to_compact_table(data.aging_inventory))
     sections.append("\n## INCOMING POs THAT PUSH DOI(proj) BEYOND 12 MONTHS\n"

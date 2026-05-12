@@ -82,6 +82,13 @@ reader sees the action AND the owning CC at a glance. Then answer:
 DO NOT write aggregate counts like "we have 600 stockouts" or "many SKUs are
 overstocked". Those are useless. Name the specific SKUs and specific actions.
 
+MANDATORY MASSIVE-OVERSTOCK COVERAGE: every row in the data's `MASSIVE OVERSTOCK`
+table represents a very large cash position (5,000+ SY combined, multi-year cover
+or dead-with-inbound). At least one bullet in Top Concerns MUST address each of
+the top 3 rows of that table when present, even if other concerns rank above
+them numerically. These are the largest dollar exposures in the portfolio and
+must never be silently skipped.
+
 ## Yesterday's Notable Changes
 Only call out yesterday's POs / receipts / backorders / sales that meaningfully
 move either priority. Skip routine activity. If nothing meaningful happened in
