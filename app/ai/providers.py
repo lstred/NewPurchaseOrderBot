@@ -84,7 +84,13 @@ def call_openai(api_key: str, model: str, system: str, messages) -> str:
     # Reasoning models also need a much larger token ceiling because their
     # reasoning tokens are billed against the same budget as the visible reply.
     if is_reasoning:
-        body["max_completion_tokens"] = 8000
+        # Reasoning models spend most of their token budget on hidden reasoning
+        # tokens; the visible reply only gets what's left.  A 1500-token brief
+        # can easily need 30k+ reasoning tokens behind it, so we set a generous
+        # ceiling.  Also ask the API to keep reasoning effort modest so more of
+        # the budget reaches the visible output.
+        body["max_completion_tokens"] = 32000
+        body["reasoning_effort"] = "medium"
     else:
         body["temperature"] = 0
         body["max_tokens"] = 2000
@@ -97,7 +103,24 @@ def call_openai(api_key: str, model: str, system: str, messages) -> str:
     timeout = 600 if is_reasoning else 180
     resp = _post_json("https://api.openai.com/v1/chat/completions", headers, body, timeout=timeout)
     try:
-        return resp["choices"][0]["message"]["content"].strip()
+        choice = resp["choices"][0]
+        text = (choice.get("message", {}).get("content") or "").strip()
+        if not text:
+            # Reasoning models can hit max_completion_tokens with nothing left
+            # for the visible reply ("finish_reason":"length").  Give the user
+            # an actionable error instead of an empty brief.
+            reason = choice.get("finish_reason") or "empty"
+            usage = resp.get("usage", {}) or {}
+            details = usage.get("completion_tokens_details", {}) or {}
+            reasoning_tok = details.get("reasoning_tokens")
+            extra = f" (reasoning_tokens={reasoning_tok})" if reasoning_tok else ""
+            raise AIError(
+                f"{model} returned an empty reply (finish_reason={reason}){extra}. "
+                "Try a non-reasoning model (e.g. gpt-4o) or rerun — reasoning "
+                "models occasionally exhaust their token budget on internal "
+                "reasoning before producing visible output."
+            )
+        return text
     except (KeyError, IndexError, TypeError):
         raise AIError(f"Unexpected OpenAI response: {json.dumps(resp)[:300]}")
 
