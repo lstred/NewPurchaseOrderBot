@@ -33,10 +33,11 @@ _OL_RE      = re.compile(r"^\s*\d+[.)]\s+")
 _INLINE_OL_RE = re.compile(r"(?<!\d)(\d+)[.)]\s+")
 # Action tags the model can prefix bullets with for visual cues.
 _ACTION_TAG_RE = re.compile(
-    r"\[(CANCEL|DEFER|EXPEDITE|REORDER|CLEARANCE|WATCH|REVIEW|HOLD)\]"
+    r"\[(NEW|CANCEL|DEFER|EXPEDITE|REORDER|CLEARANCE|WATCH|REVIEW|HOLD)\]"
 )
 
 _ACTION_TAG_CLASS = {
+    "NEW":       "act-new",
     "CANCEL":    "act-cancel",
     "DEFER":     "act-cancel",
     "HOLD":      "act-cancel",
@@ -61,7 +62,7 @@ def _inline(s: str) -> str:
     # Action-tag pills — must run AFTER html.escape so the literal `[CANCEL]`
     # text from the model is converted to a styled pill.
     s = re.sub(
-        r"\[(CANCEL|DEFER|EXPEDITE|REORDER|CLEARANCE|WATCH|REVIEW|HOLD)\]",
+        r"\[(NEW|CANCEL|DEFER|EXPEDITE|REORDER|CLEARANCE|WATCH|REVIEW|HOLD)\]",
         lambda m: _action_pill(m.group(1)),
         s,
     )
@@ -352,6 +353,7 @@ def _build_css(mode: str) -> str:
     .action-pill.act-reorder   {{ background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }}
     .action-pill.act-clearance {{ background: #faf5ff; color: #7e22ce; border-color: #e9d5ff; }}
     .action-pill.act-watch     {{ background: #f1f5f9; color: #475569; border-color: #cbd5e1; }}
+    .action-pill.act-new       {{ background: #ecfdf5; color: #047857; border-color: #6ee7b7; box-shadow: 0 0 0 1px rgba(16,185,129,0.18); }}
     code {{
         background: #f1f5f9;
         padding: 1px 5px;

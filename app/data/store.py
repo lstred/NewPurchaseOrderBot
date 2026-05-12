@@ -15,6 +15,7 @@ from app.config import APPDATA_DIR
 _TARGETS_FILE = APPDATA_DIR / "stockturn_targets.json"
 _SNOOZE_FILE = APPDATA_DIR / "snooze.json"
 _LAUNCH_FILE = APPDATA_DIR / "launch_dates.json"
+_BRIEF_SNAPSHOTS_FILE = APPDATA_DIR / "brief_snapshots.json"
 
 _DEFAULT_TARGET = 4.0
 
@@ -169,6 +170,47 @@ def delete_target(key: str) -> None:
 
 def get_all_snoozes() -> dict[str, Any]:
     return _load(_SNOOZE_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Daily-brief SKU snapshots — used to mark items that are NEW vs the
+# previous brief, so the buyer can spot fresh issues at a glance.
+# Stored as { "YYYY-MM-DD": ["SKU1", "SKU2", ...] } keyed by target_date.
+# Capped to the most recent 30 snapshots so the file stays small.
+# ---------------------------------------------------------------------------
+
+_BRIEF_SNAPSHOT_RETENTION = 30
+
+
+def get_brief_snapshot(target_date: date) -> set[str]:
+    """Return the SKUs surfaced in the brief for ``target_date`` (or empty)."""
+    data = _load(_BRIEF_SNAPSHOTS_FILE)
+    raw = data.get(target_date.isoformat()) or []
+    return {str(s) for s in raw}
+
+
+def get_prev_brief_snapshot(target_date: date) -> set[str]:
+    """Return the SKU set from the most recent snapshot strictly older than
+    ``target_date``.  Used to compute "new since last brief" badges.
+    """
+    data = _load(_BRIEF_SNAPSHOTS_FILE)
+    if not data:
+        return set()
+    target_iso = target_date.isoformat()
+    older = sorted([k for k in data.keys() if k < target_iso])
+    if not older:
+        return set()
+    return {str(s) for s in (data.get(older[-1]) or [])}
+
+
+def save_brief_snapshot(target_date: date, skus: set[str]) -> None:
+    """Persist today's brief SKU set, retaining only the most recent N days."""
+    data = _load(_BRIEF_SNAPSHOTS_FILE)
+    data[target_date.isoformat()] = sorted({str(s) for s in skus if s})
+    if len(data) > _BRIEF_SNAPSHOT_RETENTION:
+        for stale_key in sorted(data.keys())[:-_BRIEF_SNAPSHOT_RETENTION]:
+            data.pop(stale_key, None)
+    _save(_BRIEF_SNAPSHOTS_FILE, data)
 
 
 # ---------------------------------------------------------------------------

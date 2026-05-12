@@ -31,6 +31,7 @@ from sqlalchemy import text
 from app.ai.providers import call_provider, AIError, DEFAULT_MODELS
 from app.ai.schema import build_brief_system_prompt
 from app.data.db import read_dataframe
+from app.data.store import get_prev_brief_snapshot, save_brief_snapshot
 from app.services.metrics_service import DatasetBundle
 
 
@@ -155,6 +156,54 @@ WHERE o.NREFTY = 'R'
 _TRIM_ICLAST_MAX_LEN = 1
 # Only items launched at least this many days ago are mature enough to brief.
 _MIN_AGE_DAYS = 180
+# Minimum order_number length for POs that count toward actionable concerns.
+# Placeholder/manual entries like "0", "1", "99" are filtered out per buyer
+# instruction (v4.8). Real PO numbers are always 3+ characters.
+_MIN_ORDER_NUMBER_LEN = 3
+# DOI threshold (days) above which an open PO is flagged as "incoming
+# overstock" — raised from 365 to 700 in v4.8 per buyer instruction.
+_INCOMING_OVERSTOCK_DOI_DAYS = 700
+
+
+def _filter_valid_pos(open_pos: pd.DataFrame) -> pd.DataFrame:
+    """Drop placeholder POs (order_number shorter than _MIN_ORDER_NUMBER_LEN).
+
+    The buyer's source system contains placeholder PO rows with one- or
+    two-character `ORDER#` values (e.g. "0", "1") that are never real orders.
+    They distort every concern that depends on `on_order_sy`.  v4.8 strips
+    them upstream so the entire brief reasons about real POs only.
+    """
+    if open_pos is None or open_pos.empty or "order_number" not in open_pos.columns:
+        return open_pos
+    onum = open_pos["order_number"].astype(str).str.strip()
+    return open_pos[onum.str.len() >= _MIN_ORDER_NUMBER_LEN].copy()
+
+
+def _recompute_on_order_from_valid_pos(
+    sm: pd.DataFrame, valid_open_pos: pd.DataFrame
+) -> pd.DataFrame:
+    """Replace `on_order_sy` and `days_of_inventory_projected` on `sm` using
+    only the filtered valid POs.  Pure function — returns a new frame.
+    """
+    sm = sm.copy()
+    if valid_open_pos is None or valid_open_pos.empty or "base_sku" not in valid_open_pos.columns:
+        sm["on_order_sy"] = 0.0
+    else:
+        agg = (
+            valid_open_pos.groupby("base_sku")["quantity_sy"].sum()
+            .rename("on_order_sy_valid")
+        )
+        sm["on_order_sy"] = sm["sku"].map(agg).fillna(0.0).astype(float)
+    # Recompute DOI projection so every downstream filter sees the corrected value.
+    avg = sm["avg_daily_sales_sy"].astype(float)
+    inv = sm["inventory_sy"].astype(float).fillna(0.0)
+    on_order = sm["on_order_sy"].astype(float).fillna(0.0)
+    doi = (inv + on_order) / avg.where(avg > 0, other=pd.NA)
+    doi = pd.to_numeric(doi, errors="coerce").replace(
+        [float("inf"), float("-inf")], pd.NA
+    )
+    sm["days_of_inventory_projected"] = doi
+    return sm
 
 
 def _apply_eligibility_filter(sm: pd.DataFrame, target_date: date) -> tuple[pd.DataFrame, dict]:
@@ -218,6 +267,12 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
     if sm.empty:
         return data
 
+    # v4.8 — strip placeholder POs (order_number shorter than 3 chars) from the
+    # entire pipeline. Recompute on_order_sy + DOI projection from the valid
+    # subset so every downstream concern reasons about real POs only.
+    valid_open_pos = _filter_valid_pos(bundle.open_pos)
+    sm = _recompute_on_order_from_valid_pos(sm, valid_open_pos)
+
     ymd = int(target_date.strftime("%Y%m%d"))
     eligible_skus = set(sm["sku"].astype(str))
 
@@ -227,6 +282,11 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         if not df.empty:
             df["sku"] = df["sku"].astype(str).str.strip()
             df = df[df["sku"].isin(eligible_skus)]
+            # v4.8 — placeholder POs (order_number shorter than 3 chars) are
+            # buyer-irrelevant; drop before any enrichment.
+            if "order_number" in df.columns:
+                onum = df["order_number"].astype(str).str.strip()
+                df = df[onum.str.len() >= _MIN_ORDER_NUMBER_LEN]
         if not df.empty:
             # Enrich each PO row with the SKU's current avg-daily / inventory / DOI(proj)
             enrich_cols = [
@@ -372,10 +432,10 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         data.aging_inventory = aging
 
     # ------------------------------ Excessive incoming POs ------------------------------
-    # Any SKU with an open PO whose arrival will push DOI(proj) > 365 days.
-    # These are the POs to flag for cancellation/deferral.
+    # v4.8 — any SKU with a valid open PO whose arrival pushes DOI(proj) past
+    # the 700-day threshold. These are the POs to flag for cancel/defer.
     inc = sm[
-        (sm["on_order_sy"] > 0) & (sm["days_of_inventory_projected"] > 365)
+        (sm["on_order_sy"] > 0) & (sm["days_of_inventory_projected"] > _INCOMING_OVERSTOCK_DOI_DAYS)
         & (sm["avg_daily_sales_sy"] > 0)
     ].copy()
     if not inc.empty:
@@ -415,21 +475,23 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         "aging_365d_skus":   aging_skus,
     }
 
-    # ------------------------------ Massive overstock (v4.5) ------------------------------
-    # Items with very large combined exposure (inventory + on order) AND multi-year
-    # cover.  Surfaced unconditionally at high severity so they never lose the
-    # top-concerns ranking battle to many smaller higher-severity items.
-    # Thresholds intentionally permissive — the goal is to never miss a real
-    # cash-on-the-floor problem.  Final ranking is by exposure_sy, so even
-    # marginal threshold hits sort below the truly massive items.
+    # ------------------------------ Massive overstock (v4.8) ------------------------------
+    # v4.8 — only items with a VALID inbound PO qualify (on_order_sy > 0 after
+    # the placeholder-PO filter), AND combined inventory+on_order projects past
+    # 700 days of cover. Pure on-hand overstock is handled separately as a
+    # CC-section clearance fallback. The action here is always cancel/defer
+    # the inbound — these are the items the buyer can fix today.
     mo = sm.copy()
     exposure = mo["inventory_sy"].fillna(0) + mo["on_order_sy"].fillna(0)
-    doi_proj = mo["days_of_inventory_projected"].replace([float("inf"), float("-inf")], 99999).fillna(99999)
+    doi_proj = mo["days_of_inventory_projected"].replace(
+        [float("inf"), float("-inf")], 99999
+    ).fillna(99999)
     avg_daily = mo["avg_daily_sales_sy"].fillna(0)
-    big_exposure = exposure >= 3000  # SY threshold (lowered from 5000)
-    multi_year_cover = doi_proj >= 540  # 18 months (lowered from 730)
+    has_inbound = mo["on_order_sy"].fillna(0) > 0
+    big_exposure = exposure >= 3000
+    multi_year_cover = doi_proj >= _INCOMING_OVERSTOCK_DOI_DAYS
     dead_with_inbound = (avg_daily <= 0) & (mo["on_order_sy"].fillna(0) > 500)
-    mo_mask = big_exposure & (multi_year_cover | dead_with_inbound)
+    mo_mask = has_inbound & big_exposure & (multi_year_cover | dead_with_inbound)
     mo = mo[mo_mask].copy()
     if not mo.empty:
         mo["exposure_sy"] = exposure[mo_mask]
@@ -450,11 +512,76 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
     # ------------------------------ NEW v4.2 actionable metrics ------------------------------
     _build_actionable_metrics(data, sm, bundle, target_date)
 
+    # v4.8 \u2014 collapse to the two buyer-actionable categories. Tables that
+    # describe non-actionable phenomena (decelerating velocity, dead stock,
+    # receipt-to-overstock without inbound action, raw oversized-PO cuts) are
+    # subsumed by `incoming_overstock` / `needs_reorder` / `redflag_new_pos`,
+    # so we drop them so they don't appear in the rendered brief.
+    _empty = pd.DataFrame()
+    data.active_stockouts             = _empty  # folded into needs_reorder
+    data.runout_risk                  = _empty  # folded into needs_reorder
+    data.overstock_with_open_po       = _empty  # subsumed by incoming_overstock
+    data.decelerating_velocity        = _empty
+    data.dead_stock                   = _empty
+    data.receipts_pushed_to_overstock = _empty
+    data.oversized_pos_vs_demand      = _empty  # subsumed by incoming_overstock
+
     # ------------------------------ Top concerns + per-CC grouping ------------------------------
     data.top_concerns = _build_top_concerns(data, sm)
     data.cost_center_problems = _build_cost_center_breakdown(data, sm)
 
+    # v4.8 \u2014 mark concerns that are NEW since the previous brief so the buyer
+    # can recognise fresh items at a glance. Then persist today's snapshot.
+    _annotate_new_items(data, target_date)
+    _persist_snapshot(data, target_date)
+
     return data
+
+
+def _annotate_new_items(data: BriefData, target_date: date) -> None:
+    """Add an `is_new` boolean column to top_concerns and every CC table.
+
+    Compares each row's SKU to the most recent prior brief snapshot.  Rows
+    whose SKU was NOT in the prior snapshot are flagged ``is_new=True`` so the
+    AI can render a `[NEW]` badge.  First-ever brief: every row counts as new.
+    """
+    prev = get_prev_brief_snapshot(target_date)
+    # Special case: if there is literally no prior snapshot, suppress the NEW
+    # badges entirely (otherwise EVERY item is "new" \u2014 useless signal).
+    suppress = not prev
+
+    def _mark(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty or "sku" not in df.columns:
+            return df
+        if suppress:
+            df = df.copy()
+            df["is_new"] = False
+            return df
+        df = df.copy()
+        df["is_new"] = ~df["sku"].astype(str).isin(prev)
+        return df
+
+    data.top_concerns = _mark(data.top_concerns)
+    for cc_block in (data.cost_center_problems or {}).values():
+        tables = cc_block.get("tables") or {}
+        for tname, tdf in list(tables.items()):
+            tables[tname] = _mark(tdf)
+
+
+def _persist_snapshot(data: BriefData, target_date: date) -> None:
+    """Save today's brief SKU set so tomorrow's brief can flag what's new."""
+    skus: set[str] = set()
+    if data.top_concerns is not None and not data.top_concerns.empty:
+        skus.update(data.top_concerns["sku"].astype(str).tolist())
+    for cc_block in (data.cost_center_problems or {}).values():
+        for tdf in (cc_block.get("tables") or {}).values():
+            if tdf is not None and not tdf.empty and "sku" in tdf.columns:
+                skus.update(tdf["sku"].astype(str).tolist())
+    try:
+        save_brief_snapshot(target_date, skus)
+    except Exception:
+        # Snapshot persistence is best-effort \u2014 never let it break the brief.
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -657,20 +784,20 @@ def _build_actionable_metrics(
 # ---------------------------------------------------------------------------
 
 # Severity of each concern type — higher = more urgent.
+# v4.8 — collapsed to ONLY actionable types per buyer instruction.
+#   1. Items with valid open POs that push DOI > 700d (incoming_overstock)
+#   2. Items that need a new PO or expediting (needs_reorder / po_late)
+# All other historical concerns (dead_stock, decelerating, receipt-to-overstock,
+# overstock-with-po-under-700d, oversized-po, runout-risk, aging, pure-on-hand
+# massive_overstock) are dropped from the actionable feed. Aging-only items
+# survive in `data.aging_inventory` for use as a CC-section CLEARANCE fallback
+# only when a CC has no actionable items.
 _CONCERN_SEVERITY = {
-    "po_late":            100,  # PO arriving after stockout — direct lost sales
-    "redflag_new_po":      95,  # buyer entered a PO yesterday that worsens overstock
-    "massive_overstock":   92,  # huge cash on the floor + multi-year cover (v4.5)
-    "stockout":            90,  # zero stock + real demand
-    "needs_reorder":       88,  # has demand, no PO on the books — buyer must act
-    "receipt_to_overstock":85,
-    "oversized_po":        82,  # open PO huge vs trailing 90-day demand
-    "incoming_overstock":  80,  # open PO will push DOI > 365
-    "overstock_with_po":   75,
-    "dead_stock":          70,
-    "decelerating":        60,
-    "aging":               55,
-    "runout":              50,
+    "redflag_new_po":      96,  # PO entered yesterday, worsens overstock
+    "incoming_overstock":  92,  # valid open PO pushes DOI > 700d (cancel/defer)
+    "po_late":             90,  # valid PO arriving AFTER stockout (expedite/bridge)
+    "needs_reorder":       88,  # has demand, no valid PO on the books (place a PO)
+    "clearance":           40,  # fallback only — aged on-hand stock, no inbound
 }
 
 
@@ -713,47 +840,37 @@ def _concern_rows(data: BriefData) -> pd.DataFrame:
     _emit(data.redflag_new_pos, "redflag_new_po",
           "Review/cancel PO entered yesterday — it worsens an already-overstocked SKU.",
           impact_col="qty_native")
-    _emit(data.massive_overstock, "massive_overstock",
-          "Freeze inbound + open clearance plan — massive cash on the floor with multi-year cover.",
-          impact_col="exposure_sy")
-    _emit(data.active_stockouts, "stockout",
-          "Place a PO immediately — zero stock with active demand.",
-          impact_col="avg_daily_sales_sy")
     _emit(data.needs_reorder_no_po, "needs_reorder",
           "Place a new PO — active demand, no open PO, cover < 1.5x lead time.",
           impact_col="suggested_order_sy")
-    _emit(data.oversized_pos_vs_demand, "oversized_po",
-          "Cancel/defer this PO — quantity dwarfs trailing 90-day demand.",
-          impact_col="on_order_sy")
-    _emit(data.receipts_pushed_to_overstock, "receipt_to_overstock",
-          "Quarantine for markdown plan — receipt landed on overstock SKU.")
     _emit(data.excessive_incoming_pos, "incoming_overstock",
-          "Defer or cancel the open PO — arrival pushes DOI past 12 months.")
-    _emit(data.overstock_with_open_po, "overstock_with_po",
-          "Cancel/defer inbound PO; consider markdown on existing stock.")
-    _emit(data.dead_stock, "dead_stock",
-          "Liquidate / discount aggressively — stock aged 12+ months with no recent sales.")
-    _emit(data.decelerating_velocity, "decelerating",
-          "Pause future buys — 30-day demand is < 30% of 90-day baseline.")
-    _emit(data.aging_inventory, "aging",
-          "Promote, transfer, or discount — rolls aged past 365 days.")
-    _emit(data.runout_risk, "runout",
-          "Place a PO or expedite — supply < 1.5x lead-time demand.")
+          "Defer or cancel the open PO — arrival pushes DOI past 700 days.",
+          impact_col="on_order_sy")
+    # massive_overstock is wired in as a richer-attribute alias of
+    # incoming_overstock when the same SKU also clears the exposure threshold.
+    # We emit it under the `incoming_overstock` concern so the buyer sees one
+    # consolidated row per SKU, but use exposure_sy as the ranking impact.
+    _emit(data.massive_overstock, "incoming_overstock",
+          "Defer or cancel inbound — huge cash position with multi-year cover.",
+          impact_col="exposure_sy")
+    # CLEARANCE fallback — emitted only so it can show in CC sections that have
+    # no actionable items. Filtered out of top_concerns by the severity floor.
+    _emit(data.aging_inventory, "clearance",
+          "Markdown / liquidation candidate — aged stock, no inbound action available.")
 
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
 
-    # Dynamic severity boost for massive_overstock by exposure (v4.6) ---------
-    # A 50,000-SY cash position is more urgent than a 27-SY late-PO miss, but
-    # the static severity table doesn't know that.  Boost massive_overstock
-    # rows above po_late (100) when exposure is genuinely large.
+    # Dynamic severity boost for incoming_overstock by exposure (v4.6→v4.8) ---
+    # A 50,000-SY cash position is more urgent than a small late-PO miss, so
+    # boost incoming_overstock above redflag_new_po when exposure is genuinely
+    # large.  +0 at 0 SY, +5 at 50k, +10 at 100k+.
     df["severity"] = df["severity"].astype("float64")
-    mo_mask = df["concern"] == "massive_overstock"
-    if mo_mask.any():
-        # +0 at 5k exposure, +5 at 20k, +10 at 50k, +15 at 100k+ — monotonic.
-        boost = (df.loc[mo_mask, "impact"].clip(lower=0) / 10000.0).clip(upper=15.0)
-        df.loc[mo_mask, "severity"] = df.loc[mo_mask, "severity"] + boost
+    inc_mask = df["concern"] == "incoming_overstock"
+    if inc_mask.any():
+        boost = (df.loc[inc_mask, "impact"].clip(lower=0) / 10000.0).clip(upper=10.0)
+        df.loc[inc_mask, "severity"] = df.loc[inc_mask, "severity"] + boost
     return df
 
 
@@ -761,20 +878,14 @@ def _build_top_concerns(
     data: BriefData,
     sm: pd.DataFrame,
     severity_floor: float = 80.0,
-    safety_ceiling: int = 120,
+    safety_ceiling: int = 150,
 ) -> pd.DataFrame:
     """Pick every SKU/concern combination at or above the severity floor.
 
-    v4.7 — SEVERITY-FLOOR semantics (replaces v4.6 row caps):
-      - Emit EVERY row with effective severity >= ``severity_floor`` (default
-        80, which covers po_late, redflag_new_po, massive_overstock, stockout,
-        needs_reorder, receipt_to_overstock, oversized_po, incoming_overstock).
-      - No per-concern diversity quota — if the data shows 30 massive_overstock
-        items above the floor, the buyer sees all 30. The previous quota was
-        starving HAL/ROSALIE-class items out of the leader board.
-      - Hard safety ceiling of ``safety_ceiling`` rows so the prompt stays
-        under ~200 KB even on extreme days.
-      - Within the floor, sorted by severity desc, then impact desc.
+    v4.8 — only the actionable concern types survive (`incoming_overstock`,
+    `redflag_new_po`, `po_late`, `needs_reorder`); `clearance` (severity 40)
+    is excluded by the floor and only ever appears as a per-CC fallback in
+    `_build_cost_center_breakdown`.
     """
     df = _concern_rows(data)
     if df.empty:
@@ -784,57 +895,69 @@ def _build_top_concerns(
     )
     # One row per SKU — keep its highest-severity concern.
     df = df.drop_duplicates(subset=["sku"], keep="first")
-    # Severity-floor filter — the architectural change in v4.7.
     df = df[df["severity"] >= severity_floor]
     return df.head(safety_ceiling).reset_index(drop=True)
 
 
 def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
-    """Group every problem table by cost_center; skip CCs with no concerns."""
+    """Group actionable problem tables by cost_center.
+
+    v4.8 — only two action buckets are surfaced per CC:
+      - `incoming_overstock`  (valid open PO that pushes DOI > 700d, plus
+        `redflag_new_pos` and the rich-attribute `massive_overstock` overlay)
+      - `needs_reorder`       (must place / expedite a PO; combines
+        `needs_reorder_no_po` and `pos_arriving_after_stockout`)
+    A CC with zero rows in EITHER bucket falls back to a single `clearance`
+    bullet list drawn from `aging_inventory`. This matches the buyer's
+    instruction — don't show clearance unless there's literally nothing else.
+    Empty CCs (no incoming, no reorder, no aging) are omitted entirely.
+    """
     out: dict = {}
     if sm.empty:
         return out
 
     cc_col = "cost_center"
-    # Build name lookup from sm
     cc_name_lookup: dict[str, str] = {}
     if "cost_center" in sm.columns and "cost_center_desc" in sm.columns:
         for cc, name in sm.groupby("cost_center")["cost_center_desc"].first().items():
             cc_name_lookup[str(cc)] = str(name or "")
 
-    table_specs = [
+    # Bucket 1 — incoming overstock (valid PO causing DOI > 700d).
+    incoming_specs = [
+        ("incoming_overstock_pos",  data.excessive_incoming_pos),
         ("massive_overstock",       data.massive_overstock),
-        ("active_stockouts",        data.active_stockouts),
-        ("runout_risk",             data.runout_risk),
-        ("overstock_with_open_po",  data.overstock_with_open_po),
-        ("aging_inventory",         data.aging_inventory),
-        ("excessive_incoming_pos",  data.excessive_incoming_pos),
-        ("decelerating_velocity",   data.decelerating_velocity),
-        ("pos_arriving_after_stockout", data.pos_arriving_after_stockout),
         ("redflag_new_pos",         data.redflag_new_pos),
-        ("dead_stock",              data.dead_stock),
-        ("receipts_pushed_to_overstock", data.receipts_pushed_to_overstock),
-        ("needs_reorder_no_po",     data.needs_reorder_no_po),
-        ("oversized_pos_vs_demand", data.oversized_pos_vs_demand),
+    ]
+    # Bucket 2 — reorder / expedite (active demand that needs a buy).
+    reorder_specs = [
+        ("needs_reorder",                data.needs_reorder_no_po),
+        ("pos_arriving_after_stockout",  data.pos_arriving_after_stockout),
+    ]
+    # Fallback bucket — only used if both action buckets are empty for a CC.
+    fallback_specs = [
+        ("aging_clearance",         data.aging_inventory),
     ]
 
-    for name, df in table_specs:
+    def _attach(name: str, df: pd.DataFrame, bucket: str) -> None:
         if df is None or df.empty or cc_col not in df.columns:
-            continue
+            return
         for cc, sub in df.groupby(cc_col):
             cc_str = str(cc or "").strip() or "(unassigned)"
             slot = out.setdefault(cc_str, {
                 "name":   cc_name_lookup.get(cc_str, ""),
                 "tables": {},
+                "buckets": set(),
                 "kpis":   {},
             })
             slot["tables"][name] = sub.head(40).reset_index(drop=True)
+            slot["buckets"].add(bucket)
 
-    # Per-CC massive overstock overlay (v4.5) -------------------------------
-    # The global `data.massive_overstock` is capped at 20 portfolio-wide, which
-    # can starve mid-tier CCs of their own biggest items. Here we compute a
-    # CC-local top-15 directly from sm so every CC's heaviest cash positions
-    # surface in the per-CC section even if they don't crack the global top.
+    for n, df in incoming_specs:
+        _attach(n, df, "incoming")
+    for n, df in reorder_specs:
+        _attach(n, df, "reorder")
+
+    # Per-CC massive overstock overlay — v4.8 still requires a valid open PO.
     if cc_col in sm.columns:
         sm_local = sm.copy()
         exposure = sm_local["inventory_sy"].fillna(0) + sm_local["on_order_sy"].fillna(0)
@@ -842,11 +965,13 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
             [float("inf"), float("-inf")], 99999
         ).fillna(99999)
         avg_daily = sm_local["avg_daily_sales_sy"].fillna(0)
-        # Slightly lower thresholds at the per-CC level so smaller CCs still
-        # get their top items called out.
+        on_order = sm_local["on_order_sy"].fillna(0)
+        # Same shape as the global threshold but slightly smaller exposure floor
+        # so smaller CCs still surface their top items. Still requires inbound.
         mask_local = (
-            (exposure >= 3000)
-            & ((doi_proj >= 540) | ((avg_daily <= 0) & (sm_local["on_order_sy"].fillna(0) > 500)))
+            (on_order > 0)
+            & (exposure >= 3000)
+            & ((doi_proj >= _INCOMING_OVERSTOCK_DOI_DAYS) | ((avg_daily <= 0) & (on_order > 500)))
         )
         local = sm_local[mask_local].copy()
         if not local.empty:
@@ -860,20 +985,43 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
             cols = [c for c in cols if c in local.columns]
             for cc, sub in local[cols].groupby(cc_col):
                 cc_str = str(cc or "").strip() or "(unassigned)"
-                if cc_str not in out:
-                    continue  # only attach to CCs that already have other concerns
+                slot = out.setdefault(cc_str, {
+                    "name":   cc_name_lookup.get(cc_str, ""),
+                    "tables": {},
+                    "buckets": set(),
+                    "kpis":   {},
+                })
                 top_local = sub.sort_values("exposure_sy", ascending=False).head(40).reset_index(drop=True)
-                # Don't shadow the global table if it's already richer than the local one
-                existing = out[cc_str]["tables"].get("massive_overstock")
+                existing = slot["tables"].get("massive_overstock")
                 if existing is None or len(top_local) > len(existing):
-                    out[cc_str]["tables"]["massive_overstock"] = top_local
+                    slot["tables"]["massive_overstock"] = top_local
+                    slot["buckets"].add("incoming")
+
+    # Clearance fallback — attach only if the CC has no actionable buckets.
+    for n, df in fallback_specs:
+        if df is None or df.empty or cc_col not in df.columns:
+            continue
+        for cc, sub in df.groupby(cc_col):
+            cc_str = str(cc or "").strip() or "(unassigned)"
+            slot = out.get(cc_str)
+            if slot is not None and slot["buckets"]:
+                # CC already has actionable rows — do not pollute with clearance.
+                continue
+            slot = out.setdefault(cc_str, {
+                "name":   cc_name_lookup.get(cc_str, ""),
+                "tables": {},
+                "buckets": set(),
+                "kpis":   {},
+            })
+            slot["tables"][n] = sub.head(40).reset_index(drop=True)
+            slot["buckets"].add("clearance")
 
     # Per-CC quick KPIs (computed on full eligible sm, not just problem tables)
     if cc_col in sm.columns:
         for cc, sub in sm.groupby(cc_col):
             cc_str = str(cc or "").strip() or "(unassigned)"
             if cc_str not in out:
-                continue  # CC has no concerns — skip per user requirement
+                continue
             out[cc_str]["kpis"] = {
                 "skus":           int(len(sub)),
                 "inventory_sy":   float(sub["inventory_sy"].sum()),
@@ -883,6 +1031,9 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
                 "aging":          int(((sub["inventory_age_days"] >= 365) & (sub["inventory_sy"] > 0)).sum()),
             }
 
+    # `buckets` is internal bookkeeping — strip before returning.
+    for slot in out.values():
+        slot.pop("buckets", None)
     return out
 
 
@@ -950,15 +1101,20 @@ def build_brief_prompt(data: BriefData) -> str:
 
     # --- TOP CONCERNS (the lead) -------------------------------------------------
     sections.append(
-        "\n## TOP CONCERNS (severity-floor — every row >= sev 80)\n"
-        "These are EVERY SKU/issue combination across the entire eligible\n"
-        "portfolio at or above severity 80 (po_late, redflag_new_po,\n"
-        "massive_overstock, stockout, needs_reorder, receipt_to_overstock,\n"
-        "oversized_po, incoming_overstock). v4.7 dropped the row cap so HAL/\n"
-        "ROSALIE-class mid-tier positions are no longer starved out. Every row\n"
-        "already includes a specific recommended action — quote it verbatim or\n"
-        "refine, but DO NOT skip rows.\n\n"
-        + _df_to_compact_table(data.top_concerns, max_rows=120)
+        "\n## TOP CONCERNS (v4.8 — only buyer-actionable items)\n"
+        "Every row is one of TWO action types:\n"
+        "  - `incoming_overstock` / `redflag_new_po`: an OPEN, valid PO is\n"
+        "    pushing days-of-inventory past 700 — cancel or defer the inbound.\n"
+        "  - `needs_reorder` / `po_late`: active demand that requires a NEW\n"
+        "    PO or expedite — the buyer must place / accelerate supply.\n"
+        "Pure on-hand overstock without inbound is intentionally NOT in this\n"
+        "list (no buyer action available beyond markdown). Placeholder POs\n"
+        "with 1-2 char order numbers were stripped upstream.\n"
+        "\n`is_new` column = True if this SKU did not appear in the previous\n"
+        "day's brief. Render `[NEW]` immediately after the action tag for those\n"
+        "rows so the buyer can spot fresh items vs the usual offenders.\n"
+        "DO NOT skip rows.\n\n"
+        + _df_to_compact_table(data.top_concerns, max_rows=150)
     )
 
     # --- Yesterday's activity ----------------------------------------------------
@@ -982,10 +1138,13 @@ def build_brief_prompt(data: BriefData) -> str:
     if data.cost_center_problems:
         sections.append(
             "\n## PER-COST-CENTER BREAKDOWN\n"
-            "Only cost centers with at least one concern are listed. Each section's tables\n"
-            "are pre-filtered to that cost center. When you write the brief, render one\n"
-            "## CC <code> section for each block below — but if the section has no\n"
-            "actionable bullets to write, omit it entirely.\n"
+            "Only cost centers with at least one buyer-actionable concern are\n"
+            "listed. Each section's tables are pre-filtered to that cost center.\n"
+            "Render one `## CC <code>` section per block. Mark rows where the\n"
+            "data column `is_new` is True with a `[NEW]` badge after the action\n"
+            "tag. If a CC's only table is `aging_clearance`, that means it has\n"
+            "no incoming-overstock and no reorder action — emit a single short\n"
+            "`[CLEARANCE]` bullet list and nothing more.\n"
         )
         for cc_code in sorted(data.cost_center_problems.keys()):
             block = data.cost_center_problems[cc_code]
@@ -1001,52 +1160,32 @@ def build_brief_prompt(data: BriefData) -> str:
                 f"| Overstock={kpis.get('overstock', 0)} | Aged={kpis.get('aging', 0)}\n"
             )
             for tname, tdf in tables.items():
-                # v4.7: render up to 40 rows per per-CC table (was 8). The AI
-                # is mandated to bullet every massive_overstock row.
                 sections.append(f"\n#### {tname}\n" + _df_to_compact_table(tdf, max_rows=40))
 
-    # --- Cross-portfolio problem tables (fallback context) ----------------------
-    sections.append("\n## DEEPER ACTIONABLE METRICS (cross-portfolio)\n")
-
+    # --- Cross-portfolio supporting tables (raw) --------------------------------
+    sections.append(
+        "\n## CROSS-PORTFOLIO SUPPORTING TABLES\n"
+        "Every table below is filtered to v4.8's two action buckets only.\n"
+        "Use them only if you need to verify or expand on the per-CC sections.\n"
+    )
     sections.append("\n### POs ARRIVING AFTER STOCKOUT (lead time > days_until_stockout)\n"
                     + _df_to_compact_table(data.pos_arriving_after_stockout))
-    sections.append("\n### RED-FLAG NEW POs (entered yesterday on overstock SKUs / push DOI > 365)\n"
+    sections.append("\n### RED-FLAG NEW POs (entered yesterday, push DOI > 700d or land on overstock)\n"
                     + _df_to_compact_table(data.redflag_new_pos))
-    sections.append("\n### DECELERATING VELOCITY (30d sales <= 30% of 90d baseline)\n"
-                    + _df_to_compact_table(data.decelerating_velocity))
-    sections.append("\n### DEAD STOCK (aged >= 365d AND no sale in 90+ days)\n"
-                    + _df_to_compact_table(data.dead_stock))
-    sections.append("\n### RECEIPTS THAT LANDED ON OVERSTOCK SKUs\n"
-                    + _df_to_compact_table(data.receipts_pushed_to_overstock))
-    sections.append("\n### NEEDS REORDER — no PO on the books, cover < 1.5x lead time\n"
-                    "These SKUs have active demand but no open or pending PO. The\n"
-                    "`suggested_order_sy` column is a 60-day cover target net of current\n"
-                    "inventory — use it as a starting point, refine if needed.\n\n"
+    sections.append("\n### NEEDS REORDER — no valid PO on the books, cover < 1.5x lead time\n"
+                    "`suggested_order_sy` = 60-day cover target net of current inventory.\n\n"
                     + _df_to_compact_table(data.needs_reorder_no_po))
-    sections.append("\n### OVERSIZED POs vs trailing 90-day demand\n"
-                    "Open POs whose quantity is grossly oversized vs recent run-rate.\n"
-                    "`po_months_of_demand` = on_order_sy / (sales_90d / 30). Items with\n"
-                    "sales_90d = 0 are listed first — the PO is buying for a SKU with NO\n"
-                    "recent demand at all. Recommend cancel/defer/return.\n\n"
-                    + _df_to_compact_table(data.oversized_pos_vs_demand))
-
-    sections.append("\n## ACTIVE STOCKOUTS (zero inventory, real demand)\n"
-                    + _df_to_compact_table(data.active_stockouts))
-    sections.append("\n## RUNOUT RISK (will stockout before reorder arrives)\n"
-                    + _df_to_compact_table(data.runout_risk))
-    sections.append("\n## OVERSTOCK WITH OPEN PO (PO will make it worse)\n"
-                    + _df_to_compact_table(data.overstock_with_open_po))
-    sections.append("\n## MASSIVE OVERSTOCK (very large cash on the floor + multi-year cover)\n"
-                    "These are the highest-dollar overstock positions in the portfolio.\n"
-                    "`exposure_sy` = inventory_sy + on_order_sy. Items either have 2+ years of\n"
-                    "projected cover OR have an inbound PO with no current sales velocity. Every\n"
-                    "row here is a candidate for [CANCEL]/[DEFER] of inbound + [CLEARANCE] of\n"
-                    "on-hand stock. DO NOT skip these in the brief — they are priority #1 hits.\n\n"
-                    + _df_to_compact_table(data.massive_overstock))
-    sections.append("\n## AGING INVENTORY (rolls >= 365 days old)\n"
-                    + _df_to_compact_table(data.aging_inventory))
-    sections.append("\n## INCOMING POs THAT PUSH DOI(proj) BEYOND 12 MONTHS\n"
+    sections.append("\n### INCOMING-OVERSTOCK POs (valid PO pushes DOI past 700 days)\n"
                     + _df_to_compact_table(data.excessive_incoming_pos))
+    sections.append("\n### MASSIVE OVERSTOCK WITH VALID INBOUND PO\n"
+                    "Highest-dollar incoming-overstock positions. `exposure_sy` =\n"
+                    "inventory_sy + on_order_sy. Every row needs `[CANCEL]` or `[DEFER]`\n"
+                    "of the inbound PO.\n\n"
+                    + _df_to_compact_table(data.massive_overstock))
+    sections.append("\n### AGING INVENTORY (clearance fallback only — no inbound PO action)\n"
+                    "Use ONLY in CC sections where there are no incoming-overstock\n"
+                    "or reorder rows.\n\n"
+                    + _df_to_compact_table(data.aging_inventory))
 
     return "\n".join(sections)
 
