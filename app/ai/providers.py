@@ -18,7 +18,7 @@ class AIError(RuntimeError):
     pass
 
 
-def _post_json(url: str, headers: dict, body: dict, timeout: int = 90) -> dict:
+def _post_json(url: str, headers: dict, body: dict, timeout: int = 300) -> dict:
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
@@ -74,19 +74,28 @@ def call_openai(api_key: str, model: str, system: str, messages) -> str:
         raise AIError("OpenAI API key not configured.")
     full = [{"role": "system", "content": system}] + _coerce_messages(messages)
     m = model or "gpt-4o-mini"
+    is_reasoning = m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
     body = {
         "model": m,
         "messages": full,
     }
     # gpt-5 / o-series reasoning models reject custom temperature — only the
     # default (1) is supported. Older chat models accept 0 for determinism.
-    if not (m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4")):
+    # Reasoning models also need a much larger token ceiling because their
+    # reasoning tokens are billed against the same budget as the visible reply.
+    if is_reasoning:
+        body["max_completion_tokens"] = 8000
+    else:
         body["temperature"] = 0
+        body["max_tokens"] = 2000
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
-    resp = _post_json("https://api.openai.com/v1/chat/completions", headers, body)
+    # Reasoning models can spend several minutes “thinking” before the first
+    # byte of the response — give them headroom so the UI doesn't time out.
+    timeout = 600 if is_reasoning else 180
+    resp = _post_json("https://api.openai.com/v1/chat/completions", headers, body, timeout=timeout)
     try:
         return resp["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, TypeError):
