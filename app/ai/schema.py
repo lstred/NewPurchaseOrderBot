@@ -45,7 +45,15 @@ The 5-10 highest-impact, ACTIONABLE items across the entire portfolio. Use the
 TOP CONCERNS table from the data as your starting point — but write them as
 proper bullets the buyer can act on, not a copy of the table.
 
-Each bullet MUST answer:
+This section is **portfolio-wide ranking** — items here are ordered purely by
+severity and impact, regardless of cost center. The same items will reappear
+inside their cost center's section below for context. Add a short note after
+the heading: *"(portfolio-wide — items also appear under their cost center
+section)"* so the reader understands the relationship.
+
+Each bullet MUST start with the SKU's cost center in brackets, e.g.
+**[CC 010]**, so the reader can see at a glance which CC owns each issue.
+Then answer:
   - Which specific SKU (always include the SKU code)
   - What's wrong (one phrase, with the key number — e.g. "1,820 SY on hand,
     avg sales 2.1 SY/day → 866 days of cover")
@@ -62,19 +70,28 @@ move either priority. Skip routine activity. If nothing meaningful happened in
 a category, omit that category entirely.
 
 ## Cost Center Breakdown
+Add a short note after this heading: *"(every cost center referenced in Top
+Concerns appears here with its full local context — plus any CC-specific
+issues that didn't make the portfolio-wide top.)"*
+
 For each cost center listed in the PER-COST-CENTER BREAKDOWN section of the
 data, render a `## CC <code> — <name>` heading FOLLOWED by 2-6 specific,
 actionable bullets drawn from THAT cost center's tables. Each bullet follows
-the same format as Top Concerns (specific SKU, what's wrong, what to do, why).
+the same format as Top Concerns (specific SKU, what's wrong, what to do, why)
+but WITHOUT the [CC xxx] prefix (the section heading already states the CC).
 
-CRITICAL: If a cost center has no bullets worth writing, OMIT THE ENTIRE
-SECTION — do not write a header followed by "no concerns" or padding. Empty
-heading = clutter. The cost center breakdown lists only CCs that have at
-least one issue in the data; you decide which deserve bullets.
+MANDATORY: every cost center that appears in any Top Concern bullet MUST have
+its own section here — never leave a CC mentioned at the top with no section
+below. (You can include other CCs too if their data has actionable items.)
+
+If a CC has zero actionable bullets to write AND it doesn't appear in Top
+Concerns, OMIT THE ENTIRE SECTION. Empty headings = clutter.
 
 Within each CC section, group bullets logically (Stockout Watch / Overstock &
 Aging / Recommended Actions) only if there are 4+ bullets — otherwise just a
-flat list is cleaner.
+flat list is cleaner. Pay particular attention to **NEEDS REORDER** items in
+the data (active demand, zero open PO, short cover) — these are buys the
+team should be placing today.
 
 ## Recommended Actions (top 5)
 Numbered list, ranked by urgency. Each item = one decisive action with the

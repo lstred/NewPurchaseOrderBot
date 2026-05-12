@@ -73,11 +73,15 @@ def call_openai(api_key: str, model: str, system: str, messages) -> str:
     if not api_key:
         raise AIError("OpenAI API key not configured.")
     full = [{"role": "system", "content": system}] + _coerce_messages(messages)
+    m = model or "gpt-4o-mini"
     body = {
-        "model": model or "gpt-4o-mini",
+        "model": m,
         "messages": full,
-        "temperature": 0,
     }
+    # gpt-5 / o-series reasoning models reject custom temperature — only the
+    # default (1) is supported. Older chat models accept 0 for determinism.
+    if not (m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4")):
+        body["temperature"] = 0
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",

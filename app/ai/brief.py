@@ -87,6 +87,8 @@ class BriefData:
     redflag_new_pos: pd.DataFrame = field(default_factory=pd.DataFrame)
     dead_stock: pd.DataFrame = field(default_factory=pd.DataFrame)
     receipts_pushed_to_overstock: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # SKUs with low cover and zero open PO — likely need a buy now
+    needs_reorder_no_po: pd.DataFrame = field(default_factory=pd.DataFrame)
     # Per-cost-center breakdown — only CCs with at least one concern populated
     # Shape: { cc_code: { 'name': str, 'kpis': dict, 'tables': { table_name: DataFrame } } }
     cost_center_problems: dict = field(default_factory=dict)
@@ -514,6 +516,40 @@ def _build_actionable_metrics(
             ).head(15)
             data.receipts_pushed_to_overstock = rcv_bad
 
+    # 6. NEEDS REORDER (no PO on the books) ------------------------------------
+    # SKUs the buyer should be PLACING a PO on, not just expediting.  Criteria:
+    #   - has demand (avg_daily_sales_sy > 0)
+    #   - zero on order AND zero pending PO
+    #   - current cover (days_of_inventory) is short relative to lead time
+    #     (< 1.5x lead-time demand, mirroring runout-risk threshold) OR already
+    #     stocked-out with active demand
+    #   - not flagged as dead/decelerating (handled separately)
+    nr = sm.copy()
+    has_no_po = (nr["on_order_sy"] <= 0) & (nr.get("po_pending_qty", 0) <= 0)
+    has_demand = nr["avg_daily_sales_sy"] > 0
+    cover_threshold = nr["avg_daily_sales_sy"] * nr["lead_time_days"] * 1.5
+    short_cover = nr["inventory_sy"] < cover_threshold
+    needs = nr[has_no_po & has_demand & short_cover].copy()
+    if not needs.empty:
+        # Suggested order quantity: 60-day cover at current velocity, minus what's
+        # already on the floor.  Rounded to whole SY.
+        needs["suggested_order_sy"] = (
+            (needs["avg_daily_sales_sy"] * 60) - needs["inventory_sy"]
+        ).clip(lower=0).round(0)
+        # Keep only meaningful suggestions (>= 25 SY) so we don't pollute the brief
+        needs = needs[needs["suggested_order_sy"] >= 25]
+        if not needs.empty:
+            needs["days_until_stockout"] = needs["days_until_stockout"].replace(
+                [float("inf"), float("-inf")], None
+            )
+            # Rank by largest suggested PO first — biggest cash/coverage impact
+            needs = needs.sort_values("suggested_order_sy", ascending=False).head(20)
+            data.needs_reorder_no_po = needs[
+                ["sku", "sku_description", "inventory_sy", "avg_daily_sales_sy",
+                 "days_until_stockout", "lead_time_days", "suggested_order_sy",
+                 "supplier_number", "price_class_desc", "cost_center"]
+            ]
+
 
 # ---------------------------------------------------------------------------
 # Top concerns ranking + per-cost-center breakdown (v4.2)
@@ -524,6 +560,7 @@ _CONCERN_SEVERITY = {
     "po_late":            100,  # PO arriving after stockout — direct lost sales
     "redflag_new_po":      95,  # buyer entered a PO yesterday that worsens overstock
     "stockout":            90,  # zero stock + real demand
+    "needs_reorder":       88,  # has demand, no PO on the books — buyer must act
     "receipt_to_overstock":85,
     "incoming_overstock":  80,  # open PO will push DOI > 365
     "overstock_with_po":   75,
@@ -576,6 +613,9 @@ def _concern_rows(data: BriefData) -> pd.DataFrame:
     _emit(data.active_stockouts, "stockout",
           "Place a PO immediately — zero stock with active demand.",
           impact_col="avg_daily_sales_sy")
+    _emit(data.needs_reorder_no_po, "needs_reorder",
+          "Place a new PO — active demand, no open PO, cover < 1.5x lead time.",
+          impact_col="suggested_order_sy")
     _emit(data.receipts_pushed_to_overstock, "receipt_to_overstock",
           "Quarantine for markdown plan — receipt landed on overstock SKU.")
     _emit(data.excessive_incoming_pos, "incoming_overstock",
@@ -636,6 +676,7 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
         ("redflag_new_pos",         data.redflag_new_pos),
         ("dead_stock",              data.dead_stock),
         ("receipts_pushed_to_overstock", data.receipts_pushed_to_overstock),
+        ("needs_reorder_no_po",     data.needs_reorder_no_po),
     ]
 
     for name, df in table_specs:
@@ -794,6 +835,11 @@ def build_brief_prompt(data: BriefData) -> str:
                     + _df_to_compact_table(data.dead_stock))
     sections.append("\n### RECEIPTS THAT LANDED ON OVERSTOCK SKUs\n"
                     + _df_to_compact_table(data.receipts_pushed_to_overstock))
+    sections.append("\n### NEEDS REORDER — no PO on the books, cover < 1.5x lead time\n"
+                    "These SKUs have active demand but no open or pending PO. The\n"
+                    "`suggested_order_sy` column is a 60-day cover target net of current\n"
+                    "inventory — use it as a starting point, refine if needed.\n\n"
+                    + _df_to_compact_table(data.needs_reorder_no_po))
 
     sections.append("\n## ACTIVE STOCKOUTS (zero inventory, real demand)\n"
                     + _df_to_compact_table(data.active_stockouts))
