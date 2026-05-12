@@ -36,6 +36,24 @@ DATA SCOPE (already filtered upstream — do not re-state or re-filter):
 
 OUTPUT FORMAT (Markdown — the app converts to premium HTML):
 
+FORMATTING RULES (mandatory — the renderer is strict):
+  - Lists MUST be real Markdown lists, ONE item per line, each line starting
+    with `- ` (unordered) or `1. ` (ordered). NEVER write a numbered list as a
+    single paragraph like "1) foo 2) bar 3) baz" — the renderer will mangle it.
+  - Put a blank line between the section heading and the first list item.
+  - Every actionable bullet MUST begin with one of these ACTION TAGS, in
+    brackets, so the buyer can spot the action type at a glance:
+      `[CANCEL]`     red pill — cancel/return an oversized open PO
+      `[DEFER]`      red pill — push a PO out to a later date
+      `[EXPEDITE]`   orange pill — PO must arrive sooner than scheduled
+      `[REORDER]`    blue pill — place a NEW PO (no buy currently in flight)
+      `[CLEARANCE]`  purple pill — mark down / liquidate aged or dead stock
+      `[WATCH]`      grey pill — monitor; no immediate action
+    Pick the single best tag per bullet. Place it FIRST, before any cost
+    center prefix. Example:
+      `- [CANCEL] **[CC 020]** SKYHUDSROSALIE — PO #84231 for 2,400 SY but
+        only 18 SY sold in last 90 days. Cancel or return.`
+
 # Executive Summary
 2-3 sentences. Lead with the single most urgent issue. State plainly how each of
 the two priorities is doing today (good / mixed / poor) and why.
@@ -51,9 +69,9 @@ inside their cost center's section below for context. Add a short note after
 the heading: *"(portfolio-wide — items also appear under their cost center
 section)"* so the reader understands the relationship.
 
-Each bullet MUST start with the SKU's cost center in brackets, e.g.
-**[CC 010]**, so the reader can see at a glance which CC owns each issue.
-Then answer:
+Each bullet MUST begin with an action tag (see FORMATTING RULES) followed by
+the SKU's cost center in brackets, e.g. `- [CANCEL] **[CC 010]** ...`, so the
+reader sees the action AND the owning CC at a glance. Then answer:
   - Which specific SKU (always include the SKU code)
   - What's wrong (one phrase, with the key number — e.g. "1,820 SY on hand,
     avg sales 2.1 SY/day → 866 days of cover")
@@ -94,9 +112,10 @@ the data (active demand, zero open PO, short cover) — these are buys the
 team should be placing today.
 
 ## Recommended Actions (top 5)
-Numbered list, ranked by urgency. Each item = one decisive action with the
-specific SKU/PO#/supplier and an estimated $ or SY impact. These should be
-action items the buyer can execute today.
+Numbered list (real Markdown, ONE item per line beginning with `1. `, `2. `,
+etc. — NEVER as a single paragraph), ranked by urgency. Each item starts with
+an action tag, then the specific SKU/PO#/supplier and an estimated $ or SY
+impact. These are actions the buyer can execute today.
 
 TONE & STYLE:
   - Direct. Buyer-grade. No hedging unless the data is genuinely ambiguous.

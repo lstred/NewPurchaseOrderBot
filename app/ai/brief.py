@@ -89,6 +89,9 @@ class BriefData:
     receipts_pushed_to_overstock: pd.DataFrame = field(default_factory=pd.DataFrame)
     # SKUs with low cover and zero open PO — likely need a buy now
     needs_reorder_no_po: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Open POs grossly oversized vs trailing 90-day demand (catches slow/dead
+    # movers that the overstock_flag/avg_daily filter can miss).
+    oversized_pos_vs_demand: pd.DataFrame = field(default_factory=pd.DataFrame)
     # Per-cost-center breakdown — only CCs with at least one concern populated
     # Shape: { cc_code: { 'name': str, 'kpis': dict, 'tables': { table_name: DataFrame } } }
     cost_center_problems: dict = field(default_factory=dict)
@@ -550,6 +553,47 @@ def _build_actionable_metrics(
                  "supplier_number", "price_class_desc", "cost_center"]
             ]
 
+    # 7. OVERSIZED POs vs trailing 90-day demand --------------------------------
+    # Catches the SKYHUDSROSALIE pattern: open PO is huge relative to recent
+    # run-rate (or there were no sales at all), but the SKU may not trip
+    # `overstock_flag` because inventory_sy alone isn't extreme yet.  Uses the
+    # 90-day order history we already aggregated for decelerating-velocity, so
+    # it's free to compute here.
+    if not bundle.orders.empty and "order_entry_date" in bundle.orders.columns:
+        op_orders = bundle.orders[bundle.orders["base_sku"].astype(str).isin(set(sm["sku"]))]
+        if not op_orders.empty and "quantity_sy" in op_orders.columns:
+            op_orders = op_orders[~op_orders.get("backorder_flag", False)].copy()
+            cutoff_90 = target_date - timedelta(days=90)
+            sales_90 = (
+                op_orders[op_orders["order_entry_date"] >= cutoff_90]
+                .groupby("base_sku")["quantity_sy"].sum()
+                .rename("sales_90d")
+                .reset_index()
+                .rename(columns={"base_sku": "sku"})
+            )
+            op = sm[sm["on_order_sy"] > 0].merge(sales_90, on="sku", how="left")
+            op["sales_90d"] = op["sales_90d"].fillna(0.0)
+            # Coverage of the open PO in months of trailing demand. NaN when no sales.
+            sales_per_day = (op["sales_90d"] / 90.0).replace(0, pd.NA)
+            op["po_months_of_demand"] = (op["on_order_sy"] / sales_per_day / 30.0)
+            # Two flagging conditions:
+            #   (a) zero sales in the last 90 days but an open PO exists
+            #   (b) the PO covers >= 18 months of trailing demand
+            big = (op["po_months_of_demand"] >= 18).fillna(False) | (
+                (op["sales_90d"] <= 0) & (op["on_order_sy"] > 0)
+            )
+            op = op[big].copy()
+            if not op.empty:
+                # Sort: zero-demand POs first (worst), then by largest PO.
+                op["_no_demand"] = (op["sales_90d"] <= 0).astype(int)
+                op = op.sort_values(["_no_demand", "on_order_sy"], ascending=[False, False]).head(20)
+                op["po_months_of_demand"] = op["po_months_of_demand"].fillna(9999).round(1)
+                data.oversized_pos_vs_demand = op[
+                    ["sku", "sku_description", "inventory_sy", "on_order_sy",
+                     "sales_90d", "po_months_of_demand", "avg_daily_sales_sy",
+                     "supplier_number", "price_class_desc", "cost_center"]
+                ]
+
 
 # ---------------------------------------------------------------------------
 # Top concerns ranking + per-cost-center breakdown (v4.2)
@@ -562,6 +606,7 @@ _CONCERN_SEVERITY = {
     "stockout":            90,  # zero stock + real demand
     "needs_reorder":       88,  # has demand, no PO on the books — buyer must act
     "receipt_to_overstock":85,
+    "oversized_po":        82,  # open PO huge vs trailing 90-day demand
     "incoming_overstock":  80,  # open PO will push DOI > 365
     "overstock_with_po":   75,
     "dead_stock":          70,
@@ -616,6 +661,9 @@ def _concern_rows(data: BriefData) -> pd.DataFrame:
     _emit(data.needs_reorder_no_po, "needs_reorder",
           "Place a new PO — active demand, no open PO, cover < 1.5x lead time.",
           impact_col="suggested_order_sy")
+    _emit(data.oversized_pos_vs_demand, "oversized_po",
+          "Cancel/defer this PO — quantity dwarfs trailing 90-day demand.",
+          impact_col="on_order_sy")
     _emit(data.receipts_pushed_to_overstock, "receipt_to_overstock",
           "Quarantine for markdown plan — receipt landed on overstock SKU.")
     _emit(data.excessive_incoming_pos, "incoming_overstock",
@@ -677,6 +725,7 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
         ("dead_stock",              data.dead_stock),
         ("receipts_pushed_to_overstock", data.receipts_pushed_to_overstock),
         ("needs_reorder_no_po",     data.needs_reorder_no_po),
+        ("oversized_pos_vs_demand", data.oversized_pos_vs_demand),
     ]
 
     for name, df in table_specs:
@@ -840,6 +889,12 @@ def build_brief_prompt(data: BriefData) -> str:
                     "`suggested_order_sy` column is a 60-day cover target net of current\n"
                     "inventory — use it as a starting point, refine if needed.\n\n"
                     + _df_to_compact_table(data.needs_reorder_no_po))
+    sections.append("\n### OVERSIZED POs vs trailing 90-day demand\n"
+                    "Open POs whose quantity is grossly oversized vs recent run-rate.\n"
+                    "`po_months_of_demand` = on_order_sy / (sales_90d / 30). Items with\n"
+                    "sales_90d = 0 are listed first — the PO is buying for a SKU with NO\n"
+                    "recent demand at all. Recommend cancel/defer/return.\n\n"
+                    + _df_to_compact_table(data.oversized_pos_vs_demand))
 
     sections.append("\n## ACTIVE STOCKOUTS (zero inventory, real demand)\n"
                     + _df_to_compact_table(data.active_stockouts))

@@ -25,6 +25,32 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _BOLD_RE    = re.compile(r"\*\*(.+?)\*\*")
 _ITALIC_RE  = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
 _CODE_RE    = re.compile(r"`([^`]+?)`")
+# Ordered-list bullets: accept both "1." and "1)" markers.
+_OL_RE      = re.compile(r"^\s*\d+[.)]\s+")
+# Inline numbered run that should be split into separate bullets,
+# e.g. "1) foo bar 2) baz qux 3) ...". Used to rescue paragraphs
+# the model glued together.
+_INLINE_OL_RE = re.compile(r"(?<!\d)(\d+)[.)]\s+")
+# Action tags the model can prefix bullets with for visual cues.
+_ACTION_TAG_RE = re.compile(
+    r"\[(CANCEL|DEFER|EXPEDITE|REORDER|CLEARANCE|WATCH|REVIEW|HOLD)\]"
+)
+
+_ACTION_TAG_CLASS = {
+    "CANCEL":    "act-cancel",
+    "DEFER":     "act-cancel",
+    "HOLD":      "act-cancel",
+    "EXPEDITE":  "act-expedite",
+    "REORDER":   "act-reorder",
+    "CLEARANCE": "act-clearance",
+    "WATCH":     "act-watch",
+    "REVIEW":    "act-watch",
+}
+
+
+def _action_pill(tag: str) -> str:
+    css = _ACTION_TAG_CLASS.get(tag.upper(), "act-watch")
+    return f'<span class="action-pill {css}">{html.escape(tag.upper())}</span>'
 
 
 def _inline(s: str) -> str:
@@ -32,6 +58,13 @@ def _inline(s: str) -> str:
     s = _BOLD_RE.sub(r"<strong>\1</strong>", s)
     s = _ITALIC_RE.sub(r"<em>\1</em>", s)
     s = _CODE_RE.sub(r"<code>\1</code>", s)
+    # Action-tag pills — must run AFTER html.escape so the literal `[CANCEL]`
+    # text from the model is converted to a styled pill.
+    s = re.sub(
+        r"\[(CANCEL|DEFER|EXPEDITE|REORDER|CLEARANCE|WATCH|REVIEW|HOLD)\]",
+        lambda m: _action_pill(m.group(1)),
+        s,
+    )
     return s
 
 
@@ -136,14 +169,28 @@ def _markdown_to_html(md: str) -> str:
             i += 1
             continue
 
-        # Ordered list
-        if re.match(r"^\s*\d+\.\s+", line):
+        # Ordered list ("1." or "1)")
+        if _OL_RE.match(line):
             if not in_ol:
                 close_lists()
                 out.append('<ol class="brief-list">')
                 in_ol = True
-            text = re.sub(r"^\s*\d+\.\s+", "", line)
-            out.append(f"<li>{_inline(text)}</li>")
+            text = _OL_RE.sub("", line)
+            # Rescue: a single line containing multiple inline markers like
+            # "foo bar 2) baz 3) qux" must be split into separate <li>s.
+            inline = list(_INLINE_OL_RE.finditer(text))
+            if inline:
+                first_item = text[: inline[0].start()].strip().rstrip(".;,")
+                if first_item:
+                    out.append(f"<li>{_inline(first_item)}</li>")
+                for k, m in enumerate(inline):
+                    start = m.end()
+                    end = inline[k + 1].start() if k + 1 < len(inline) else len(text)
+                    item = text[start:end].strip().rstrip(".;,")
+                    if item:
+                        out.append(f"<li>{_inline(item)}</li>")
+            else:
+                out.append(f"<li>{_inline(text)}</li>")
             i += 1
             continue
 
@@ -155,13 +202,28 @@ def _markdown_to_html(md: str) -> str:
         while j < len(lines) and lines[j].strip() and not (
             _HEADING_RE.match(lines[j])
             or re.match(r"^\s*[-*•]\s+", lines[j])
-            or re.match(r"^\s*\d+\.\s+", lines[j])
+            or _OL_RE.match(lines[j])
             or "|" in lines[j]
         ):
             para_lines.append(lines[j].rstrip())
             j += 1
         text = " ".join(para_lines).strip()
-        out.append(f"<p>{_inline(text)}</p>")
+
+        # Rescue: model occasionally writes "1) foo 2) bar 3) baz" inline as a
+        # single paragraph instead of a real list. Detect 2+ inline numbered
+        # markers and split into a proper <ol>.
+        markers = list(_INLINE_OL_RE.finditer(text))
+        if len(markers) >= 2 and markers[0].start() <= 4:
+            out.append('<ol class="brief-list">')
+            for k, m in enumerate(markers):
+                start = m.end()
+                end = markers[k + 1].start() if k + 1 < len(markers) else len(text)
+                item = text[start:end].strip().rstrip(".;,")
+                if item:
+                    out.append(f"<li>{_inline(item)}</li>")
+            out.append("</ol>")
+        else:
+            out.append(f"<p>{_inline(text)}</p>")
         i = j
 
     close_lists()
@@ -272,7 +334,24 @@ def _build_css(mode: str) -> str:
     h4.brief-h4 {{ font-size: 14px; }}
     p {{ margin: 8px 0; }}
     ul.brief-list, ol.brief-list {{ margin: 8px 0 14px 22px; padding: 0; }}
-    ul.brief-list li, ol.brief-list li {{ margin: 4px 0; }}
+    ul.brief-list li, ol.brief-list li {{ margin: 6px 0; }}
+    .action-pill {{
+        display: inline-block;
+        padding: 1px 8px;
+        margin-right: 6px;
+        border-radius: 999px;
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+        vertical-align: 1px;
+        border: 1px solid transparent;
+    }}
+    .action-pill.act-cancel    {{ background: #fef2f2; color: #b91c1c; border-color: #fecaca; }}
+    .action-pill.act-expedite  {{ background: #fff7ed; color: #c2410c; border-color: #fed7aa; }}
+    .action-pill.act-reorder   {{ background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }}
+    .action-pill.act-clearance {{ background: #faf5ff; color: #7e22ce; border-color: #e9d5ff; }}
+    .action-pill.act-watch     {{ background: #f1f5f9; color: #475569; border-color: #cbd5e1; }}
     code {{
         background: #f1f5f9;
         padding: 1px 5px;
