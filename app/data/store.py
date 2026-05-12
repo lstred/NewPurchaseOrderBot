@@ -321,76 +321,7 @@ def set_ai_config(cfg: dict) -> None:
 # (Saved-query helpers were removed in v4.0 along with the Q&A AI tab.)
 # ---------------------------------------------------------------------------
 
-import uuid as _uuid
-from datetime import datetime as _datetime
+# AI memory notes were removed in v4.1 — the daily brief is fully data-driven
+# and does not need persistent user-authored rules. The on-disk ai_notes.json
+# file (if present from v3.x/v4.0) is harmless and can be deleted manually.
 
-# ---------------------------------------------------------------------------
-# AI knowledge base / memory notes
-# Persistent rules, preferences, and nuances the AI should always apply.
-# Schema (list of dicts): {"id": str, "text": str, "created": iso8601}
-# ---------------------------------------------------------------------------
-
-_AI_NOTES_FILE = APPDATA_DIR / "ai_notes.json"
-
-
-def get_ai_notes() -> list[dict]:
-    data = _load(_AI_NOTES_FILE)
-    items = data.get("notes", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-    out = []
-    for n in items:
-        if not isinstance(n, dict):
-            continue
-        text = str(n.get("text", "")).strip()
-        if not text:
-            continue
-        out.append({
-            "id":      str(n.get("id") or _uuid.uuid4()),
-            "text":    text,
-            "created": str(n.get("created", _datetime.now().isoformat(timespec='seconds'))),
-        })
-    # Preserve insertion order (oldest → newest); sorting would lose user intent.
-    return out
-
-
-def _save_ai_notes(notes: list[dict]) -> None:
-    _save(_AI_NOTES_FILE, {"notes": notes})
-
-
-def add_ai_note(text: str) -> dict | None:
-    text = str(text).strip()
-    if not text:
-        return None
-    notes = get_ai_notes()
-    # Dedupe (case-insensitive exact match) — avoid bloating the prompt with repeats.
-    for n in notes:
-        if n["text"].lower() == text.lower():
-            return n
-    new = {
-        "id":      str(_uuid.uuid4()),
-        "text":    text,
-        "created": _datetime.now().isoformat(timespec='seconds'),
-    }
-    notes.append(new)
-    _save_ai_notes(notes)
-    return new
-
-
-def update_ai_note(note_id: str, text: str) -> None:
-    text = str(text).strip()
-    if not text:
-        return
-    notes = get_ai_notes()
-    for n in notes:
-        if n["id"] == note_id:
-            n["text"] = text
-            break
-    _save_ai_notes(notes)
-
-
-def delete_ai_note(note_id: str) -> None:
-    notes = [n for n in get_ai_notes() if n["id"] != note_id]
-    _save_ai_notes(notes)
-
-
-def clear_ai_notes() -> None:
-    _save_ai_notes([])

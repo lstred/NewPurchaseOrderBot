@@ -1,35 +1,33 @@
 """
-Daily Brief tab — replaces the v3.x AI Q&A chat (v4.0).
+Daily Brief tab (v4.1) — replaces the v3.x AI Q&A chat.
 
-Features
---------
-* Date picker (default = yesterday) selects the brief's reporting date.
-* Provider/Model dropdowns (read from store.get_ai_config / write on change).
-* "✨ Generate Brief" runs gather_brief_data + provider call on a worker thread.
-* Brief is rendered as premium HTML inside QTextBrowser.
-* Export: 📄 PDF (via QPrinter+QTextDocument), 📧 HTML (file), 📋 Copy HTML.
-* Memory notes sidebar — same persistent "teach me once" mechanism as v3.x;
-  the AI honors these on every brief generation.
+Layout:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  📋 Daily Brief    Date  Provider  Model        ✨ Generate     │  ← gradient bar
+  ├──────────────────────────────────────────────────────────────────┤
+  │  status line                          📄 PDF · 📧 HTML · 📋 Copy │  ← actions row
+  ├──────────────────────────────────────────────────────────────────┤
+  │                                                                  │
+  │              full-width premium HTML brief viewer                │
+  │                                                                  │
+  └──────────────────────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal, QDate, QUrl
+from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal, QDate
 from PyQt6.QtGui import QTextDocument, QPageLayout, QPageSize
 from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDateEdit, QFileDialog, QFrame, QHBoxLayout,
-    QInputDialog, QLabel, QListWidget, QListWidgetItem, QMessageBox,
-    QPushButton, QSizePolicy, QSplitter, QTextBrowser, QVBoxLayout, QWidget,
+    QLabel, QMessageBox, QPushButton, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from app.ai.brief import (
-    BriefResult, gather_brief_data, generate_brief,
-)
+from app.ai.brief import BriefResult, gather_brief_data, generate_brief
 from app.ai.brief_renderer import render_to_html
 from app.ai.providers import DEFAULT_MODELS
 from app.data import store
@@ -37,11 +35,10 @@ from app.services.metrics_service import DatasetBundle
 import app.ui.theme as theme
 
 
-# Per-provider known-good models, populated into the model combo.
 _PROVIDER_MODELS = {
     "anthropic": ["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5"],
-    "openai":    ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o1-mini"],
-    "google":    ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"],
+    "openai":    ["gpt-5", "gpt-5-mini", "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o1-mini"],
+    "google":    ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
 }
 
 
@@ -89,7 +86,6 @@ class BriefTab(QWidget):
 
         self._build_ui()
         self._load_provider_config()
-        self._refresh_notes()
         self._show_placeholder()
 
     # ------------------------------------------------------------------ UI
@@ -98,20 +94,34 @@ class BriefTab(QWidget):
         outer.setContentsMargins(14, 12, 14, 12)
         outer.setSpacing(10)
 
-        # ---- Top control bar -----------------------------------------------
+        # ---- Top control bar (gradient) ----------------------------------
         bar = QFrame()
         bar.setObjectName("briefBar")
-        bar.setStyleSheet(f"""
-            QFrame#briefBar {{
+        bar.setStyleSheet("""
+            QFrame#briefBar {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 #6366f1, stop:0.5 #8b5cf6, stop:1 #ec4899);
                 border-radius: 10px;
-                padding: 10px;
-            }}
-            QFrame#briefBar QLabel {{ color: white; font-weight: 600; }}
+            }
+            QFrame#briefBar QLabel { color: white; font-weight: 600; }
+            QFrame#briefBar QComboBox, QFrame#briefBar QDateEdit {
+                background: rgba(255,255,255,0.18);
+                color: white;
+                border: 1px solid rgba(255,255,255,0.35);
+                border-radius: 5px;
+                padding: 4px 8px;
+                min-height: 26px;
+            }
+            QFrame#briefBar QComboBox:hover, QFrame#briefBar QDateEdit:hover {
+                background: rgba(255,255,255,0.28);
+            }
+            QFrame#briefBar QComboBox QAbstractItemView {
+                background: #1f2937; color: white;
+                selection-background-color: #6366f1;
+            }
         """)
         bl = QHBoxLayout(bar)
-        bl.setContentsMargins(14, 8, 14, 8)
+        bl.setContentsMargins(16, 10, 16, 10)
         bl.setSpacing(10)
 
         title = QLabel("📋  Daily Brief")
@@ -123,15 +133,15 @@ class BriefTab(QWidget):
         self._date = QDateEdit()
         self._date.setCalendarPopup(True)
         self._date.setDisplayFormat("yyyy-MM-dd")
-        self._date.setMinimumWidth(120)
+        self._date.setMinimumWidth(130)
         y = date.today() - timedelta(days=1)
         self._date.setDate(QDate(y.year, y.month, y.day))
         bl.addWidget(self._date)
 
-        bl.addSpacing(8)
+        bl.addSpacing(6)
         bl.addWidget(QLabel("Provider:"))
         self._provider_combo = QComboBox()
-        self._provider_combo.addItems(["anthropic", "openai", "google"])
+        self._provider_combo.addItems(["openai", "anthropic", "google"])
         self._provider_combo.setMinimumWidth(110)
         self._provider_combo.currentTextChanged.connect(self._on_provider_changed)
         bl.addWidget(self._provider_combo)
@@ -139,17 +149,18 @@ class BriefTab(QWidget):
         bl.addWidget(QLabel("Model:"))
         self._model_combo = QComboBox()
         self._model_combo.setEditable(True)
-        self._model_combo.setMinimumWidth(170)
+        self._model_combo.setMinimumWidth(180)
         self._model_combo.currentTextChanged.connect(self._on_model_changed)
         bl.addWidget(self._model_combo)
 
         self._btn_generate = QPushButton("✨ Generate Brief")
-        self._btn_generate.setMinimumHeight(36)
+        self._btn_generate.setMinimumHeight(34)
+        self._btn_generate.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_generate.setStyleSheet("""
             QPushButton {
                 background: white; color: #6366f1;
-                border-radius: 6px; padding: 6px 18px;
-                font-weight: 700;
+                border: none; border-radius: 6px;
+                padding: 6px 18px; font-weight: 700;
             }
             QPushButton:hover { background: #f3f4f6; }
             QPushButton:disabled { background: #d1d5db; color: #9ca3af; }
@@ -159,85 +170,63 @@ class BriefTab(QWidget):
 
         outer.addWidget(bar)
 
-        # ---- Status line ---------------------------------------------------
+        # ---- Status / actions row -----------------------------------------
+        actions = QHBoxLayout()
+        actions.setContentsMargins(2, 0, 2, 0)
+        actions.setSpacing(8)
+
         self._status = QLabel("")
-        self._status.setStyleSheet(f"color: {theme.get('text_muted')}; padding: 0 4px;")
-        outer.addWidget(self._status)
+        self._status.setStyleSheet(f"color: {theme.get('text_muted')};")
+        actions.addWidget(self._status)
+        actions.addStretch()
 
-        # ---- Splitter: brief | notes sidebar -------------------------------
-        split = QSplitter(Qt.Orientation.Horizontal)
-        outer.addWidget(split, 1)
-
-        # Brief viewer
-        self._viewer = QTextBrowser()
-        self._viewer.setOpenExternalLinks(True)
-        self._viewer.setStyleSheet("QTextBrowser { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; }")
-        split.addWidget(self._viewer)
-
-        # Sidebar (notes + actions)
-        side = QFrame()
-        side.setObjectName("briefSide")
-        side.setStyleSheet(f"QFrame#briefSide {{ background: {theme.get('bg_card')}; border-radius: 8px; }}")
-        sl = QVBoxLayout(side)
-        sl.setContentsMargins(12, 12, 12, 12)
-        sl.setSpacing(8)
-
-        # Export action group
-        export_lbl = QLabel("EXPORT")
-        export_lbl.setStyleSheet(f"color: {theme.get('text_muted')}; font-size: 10px; font-weight: 700; letter-spacing: 1px;")
-        sl.addWidget(export_lbl)
-
-        self._btn_pdf  = QPushButton("📄  Export PDF")
-        self._btn_html = QPushButton("📧  Export HTML for Email")
-        self._btn_copy = QPushButton("📋  Copy HTML to Clipboard")
-        for b in (self._btn_pdf, self._btn_html, self._btn_copy):
-            b.setMinimumHeight(32)
-            b.setEnabled(False)
-            sl.addWidget(b)
+        self._btn_pdf  = self._make_action_btn("📄  Export PDF")
+        self._btn_html = self._make_action_btn("📧  Export HTML")
+        self._btn_copy = self._make_action_btn("📋  Copy HTML")
+        actions.addWidget(self._btn_pdf)
+        actions.addWidget(self._btn_html)
+        actions.addWidget(self._btn_copy)
         self._btn_pdf.clicked.connect(self._on_export_pdf)
         self._btn_html.clicked.connect(self._on_export_html)
         self._btn_copy.clicked.connect(self._on_copy)
+        for b in (self._btn_pdf, self._btn_html, self._btn_copy):
+            b.setEnabled(False)
 
-        sl.addSpacing(12)
+        outer.addLayout(actions)
 
-        notes_hdr = QHBoxLayout()
-        notes_lbl = QLabel("🧠  AI MEMORY NOTES")
-        notes_lbl.setStyleSheet(f"color: {theme.get('text_muted')}; font-size: 10px; font-weight: 700; letter-spacing: 1px;")
-        notes_hdr.addWidget(notes_lbl)
-        notes_hdr.addStretch()
-        self._btn_add_note = QPushButton("+ Add")
-        self._btn_add_note.setObjectName("flat")
-        self._btn_add_note.clicked.connect(self._on_add_note)
-        notes_hdr.addWidget(self._btn_add_note)
-        sl.addLayout(notes_hdr)
+        # ---- Viewer (full width) ------------------------------------------
+        self._viewer = QTextBrowser()
+        self._viewer.setOpenExternalLinks(True)
+        self._viewer.setStyleSheet(
+            "QTextBrowser { background: #ffffff; border: 1px solid #e5e7eb;"
+            " border-radius: 8px; padding: 4px; }"
+        )
+        outer.addWidget(self._viewer, 1)
 
-        hint = QLabel("Rules and preferences applied on every brief.\nThe AI will honor these every time.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {theme.get('text_muted')}; font-size: 11px;")
-        sl.addWidget(hint)
-
-        self._notes_list = QListWidget()
-        self._notes_list.itemDoubleClicked.connect(lambda *_: self._on_edit_note())
-        sl.addWidget(self._notes_list, 1)
-
-        note_btns = QHBoxLayout()
-        self._btn_edit_note = QPushButton("Edit")
-        self._btn_edit_note.setObjectName("flat")
-        self._btn_edit_note.clicked.connect(self._on_edit_note)
-        note_btns.addWidget(self._btn_edit_note)
-        self._btn_del_note = QPushButton("Delete")
-        self._btn_del_note.setObjectName("flat")
-        self._btn_del_note.clicked.connect(self._on_delete_note)
-        note_btns.addWidget(self._btn_del_note)
-        note_btns.addStretch()
-        sl.addLayout(note_btns)
-
-        side.setMinimumWidth(260)
-        side.setMaximumWidth(360)
-        split.addWidget(side)
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 0)
-        split.setSizes([900, 280])
+    def _make_action_btn(self, text: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setMinimumHeight(30)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setStyleSheet(f"""
+            QPushButton {{
+                background: {theme.get('bg_card')};
+                color: {theme.get('text')};
+                border: 1px solid {theme.get('border')};
+                border-radius: 6px;
+                padding: 4px 14px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                border-color: {theme.get('accent')};
+                color: {theme.get('accent')};
+            }}
+            QPushButton:disabled {{
+                color: {theme.get('text_muted')};
+                border-color: {theme.get('border')};
+                background: transparent;
+            }}
+        """)
+        return b
 
     # ------------------------------------------------------------------ Public
     def refresh(self, bundle: DatasetBundle) -> None:
@@ -260,10 +249,8 @@ class BriefTab(QWidget):
         if preselect and preselect in models:
             self._model_combo.setCurrentText(preselect)
         elif models:
-            # Use DEFAULT_MODELS recommended for this provider
             default = DEFAULT_MODELS.get(provider, models[0])
-            if default in models:
-                self._model_combo.setCurrentText(default)
+            self._model_combo.setCurrentText(default if default in models else models[0])
         self._model_combo.blockSignals(False)
 
     def _on_provider_changed(self, name: str) -> None:
@@ -278,45 +265,6 @@ class BriefTab(QWidget):
         cfg["provider"] = self._provider_combo.currentText()
         cfg["model"]    = self._model_combo.currentText().strip()
         store.set_ai_config(cfg)
-
-    # ------------------------------------------------------------------ Notes
-    def _refresh_notes(self) -> None:
-        self._notes_list.clear()
-        for n in store.get_ai_notes():
-            item = QListWidgetItem(n["text"])
-            item.setData(Qt.ItemDataRole.UserRole, n["id"])
-            self._notes_list.addItem(item)
-
-    def _on_add_note(self) -> None:
-        text, ok = QInputDialog.getMultiLineText(
-            self, "Add AI Memory Note",
-            "Rule, preference, or business nuance the AI should always apply:",
-        )
-        if ok and text.strip():
-            store.add_ai_note(text.strip())
-            self._refresh_notes()
-
-    def _on_edit_note(self) -> None:
-        item = self._notes_list.currentItem()
-        if not item:
-            return
-        nid = item.data(Qt.ItemDataRole.UserRole)
-        text, ok = QInputDialog.getMultiLineText(
-            self, "Edit AI Memory Note", "Rule:", item.text(),
-        )
-        if ok and text.strip():
-            store.update_ai_note(nid, text.strip())
-            self._refresh_notes()
-
-    def _on_delete_note(self) -> None:
-        item = self._notes_list.currentItem()
-        if not item:
-            return
-        if QMessageBox.question(
-            self, "Delete note", "Delete this AI memory note?"
-        ) == QMessageBox.StandardButton.Yes:
-            store.delete_ai_note(item.data(Qt.ItemDataRole.UserRole))
-            self._refresh_notes()
 
     # ------------------------------------------------------------------ Generate
     def _on_generate(self) -> None:
@@ -336,7 +284,6 @@ class BriefTab(QWidget):
             )
             return
 
-        # Re-entrancy / dead-thread guard (mirrors main_window pattern)
         try:
             if self._thread is not None and self._thread.isRunning():
                 return
@@ -383,7 +330,6 @@ class BriefTab(QWidget):
             self._on_brief_error(result.error)
             return
         self._last_result = result
-        # Re-gather KPIs for the renderer (cheap — doesn't re-query SQL except yesterday tables already cached at OS level)
         try:
             data = gather_brief_data(result.target_date, self._bundle)
             self._last_kpis = data.portfolio_kpis
@@ -398,21 +344,22 @@ class BriefTab(QWidget):
             f"~{result.tokens_in:,} in / ~{result.tokens_out:,} out · "
             f"≈ ${result.cost_usd:.4f}"
         )
+        self._status.setStyleSheet(f"color: {theme.get('success')};")
 
     def _on_brief_error(self, msg: str) -> None:
         self._set_busy(False)
         self._status.setText(f"✗ Error: {msg}")
-        self._status.setStyleSheet(f"color: {theme.get('danger')}; padding: 0 4px;")
+        self._status.setStyleSheet(f"color: {theme.get('danger')};")
         QMessageBox.critical(self, "Brief generation failed", msg)
-        self._status.setStyleSheet(f"color: {theme.get('text_muted')}; padding: 0 4px;")
 
     def _set_busy(self, busy: bool, msg: str = "") -> None:
         self._btn_generate.setEnabled(not busy)
         self._btn_generate.setText("⏳ Generating…" if busy else "✨ Generate Brief")
         if msg:
+            self._status.setStyleSheet(f"color: {theme.get('text_muted')};")
             self._status.setText(msg)
         elif not busy:
-            self._status.setText("")
+            pass  # keep last status visible
 
     # ------------------------------------------------------------------ Export
     def _on_export_pdf(self) -> None:
@@ -457,8 +404,8 @@ class BriefTab(QWidget):
             Path(path).write_text(html_text, encoding="utf-8")
             QMessageBox.information(
                 self, "HTML saved",
-                f"Saved to:\n{path}\n\nThis file is styled for email — open it and copy/paste "
-                "the rendered content into Outlook, or attach the file directly.",
+                f"Saved to:\n{path}\n\nOpen the file and copy/paste the rendered "
+                "content into Outlook, or attach the file directly.",
             )
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "HTML export failed", str(e))
@@ -469,24 +416,30 @@ class BriefTab(QWidget):
         html_text = render_to_html(self._last_result, kpis=self._last_kpis, mode="email")
         QApplication.clipboard().setText(html_text)
         self._status.setText("✓ HTML copied to clipboard.")
+        self._status.setStyleSheet(f"color: {theme.get('success')};")
 
     # ------------------------------------------------------------------ Placeholder
     def _show_placeholder(self) -> None:
         ph = """
-        <html><body style="font-family: 'Segoe UI', Arial, sans-serif; padding: 60px;
-                           color: #6b7280; text-align: center;">
-        <div style="max-width: 540px; margin: 0 auto;">
-            <div style="font-size: 64px; margin-bottom: 16px;">📋</div>
-            <h2 style="color: #1f2937; font-weight: 700; margin: 0 0 12px 0;">Ready when you are</h2>
-            <p style="font-size: 14px; line-height: 1.6; margin: 0 0 22px 0;">
+        <html><body style="font-family: 'Segoe UI', Arial, sans-serif; padding: 80px 40px;
+                           color: #6b7280; text-align: center; background: #ffffff;">
+        <div style="max-width: 620px; margin: 0 auto;">
+            <div style="font-size: 72px; margin-bottom: 20px;">📋</div>
+            <h1 style="color: #111827; font-weight: 800; font-size: 28px; margin: 0 0 14px 0;
+                       background: linear-gradient(90deg, #6366f1, #8b5cf6, #ec4899);
+                       -webkit-background-clip: text; color: transparent;">
+                Ready when you are
+            </h1>
+            <p style="font-size: 15px; line-height: 1.7; margin: 0 0 28px 0; color: #4b5563;">
                 Pick a date (defaults to <strong>yesterday</strong>) and click
-                <strong>✨ Generate Brief</strong>. The AI will produce a thorough yet
-                at-a-glance executive briefing focused on the two business priorities:
+                <strong>✨ Generate Brief</strong>. Your AI will produce a thorough yet
+                at-a-glance executive briefing focused on the two priorities:
                 avoiding 12-month inventory and avoiding stockouts.
             </p>
-            <p style="font-size: 12px; color: #9ca3af; margin: 0;">
+            <div style="display: inline-block; padding: 12px 22px; border-radius: 8px;
+                        background: #f9fafb; border: 1px solid #e5e7eb; font-size: 12px; color: #6b7280;">
                 Configure your AI provider + API key in the Settings tab.
-            </p>
+            </div>
         </div>
         </body></html>
         """

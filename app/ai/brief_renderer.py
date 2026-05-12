@@ -340,11 +340,10 @@ def _kpi_strip(kpis: dict) -> str:
 
 
 def _banner(result: BriefResult) -> str:
-    d = result.target_date.strftime("%A, %B %-d, %Y") if hasattr(result.target_date, "strftime") else str(result.target_date)
-    # %-d is POSIX; strip leading zero manually for Windows compatibility
+    # %-d is POSIX-only; format with %d then strip the leading zero manually
+    # so this works on Windows.
     try:
         d = result.target_date.strftime("%A, %B %d, %Y")
-        # Strip leading zero from day
         d = re.sub(r"\b0(\d)", r"\1", d)
     except Exception:
         d = str(result.target_date)

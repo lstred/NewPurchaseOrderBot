@@ -32,7 +32,6 @@ from sqlalchemy import text
 from app.ai.providers import call_provider, AIError, DEFAULT_MODELS
 from app.ai.schema import build_brief_system_prompt
 from app.data.db import read_dataframe
-from app.data.store import get_ai_notes
 from app.services.metrics_service import DatasetBundle
 
 
@@ -40,6 +39,9 @@ from app.services.metrics_service import DatasetBundle
 # Update freely; this is informational only.
 _PRICING = {
     # OpenAI
+    "gpt-5":           (1.25, 10.00),
+    "gpt-5-mini":      (0.25,  2.00),
+    "gpt-5-nano":      (0.05,  0.40),
     "gpt-4o":          (2.50, 10.00),
     "gpt-4o-mini":     (0.15,  0.60),
     "gpt-4.1":         (2.00,  8.00),
@@ -421,10 +423,9 @@ def generate_brief(
     Synchronous — call from a worker thread.
     """
     started = time.time()
-    notes = get_ai_notes()
     data = gather_brief_data(target_date, bundle)
     user_msg = build_brief_prompt(data)
-    system_msg = build_brief_system_prompt(notes=notes, target_date=target_date)
+    system_msg = build_brief_system_prompt(target_date=target_date)
 
     if not model:
         model = DEFAULT_MODELS.get((provider or "openai").lower(), "gpt-4o")

@@ -76,28 +76,12 @@ TONE & STYLE:
     in the data ("place a PO for ~N SY"), suggest a sensible value derived from the
     inputs (e.g. avg_daily * 60 days) and SAY where the number came from.
   - Quantities are in square yards (SY) unless stated otherwise.
-  - Honor any USER PREFERENCES & NOTES below verbatim — these are buyer rules
-    that override default reasoning.
 """
 
 
-def build_brief_system_prompt(
-    notes: list[dict] | None = None,
-    target_date: Optional[date] = None,
-) -> str:
-    """Assemble the system prompt for the brief generator.
-
-    Memory notes (from store.get_ai_notes()) are injected verbatim — this is the
-    same "teach the AI once, never again" mechanism from v3.x, preserved.
-    """
+def build_brief_system_prompt(target_date: Optional[date] = None) -> str:
+    """Assemble the system prompt for the daily brief generator."""
     parts = [_BRIEF_SYSTEM]
     if target_date:
         parts.append(f"\nBRIEF DATE: {target_date.isoformat()}")
-    if notes:
-        parts.append("\nUSER PREFERENCES & NOTES (always apply unless the user overrides them):")
-        for i, n in enumerate(notes, 1):
-            text = str(n.get("text", "")).strip().replace("\n", " ")
-            if text:
-                parts.append(f"  {i}. {text}")
-        parts.append("")
     return "\n".join(parts)
