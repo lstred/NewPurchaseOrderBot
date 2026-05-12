@@ -937,8 +937,13 @@ def generate_brief(
     provider: str,
     api_key: str,
     model: str,
+    options: dict | None = None,
 ) -> BriefResult:
     """Run the full pipeline and return a BriefResult.
+
+    `options` may contain user-tuned generation parameters
+    (max_tokens, reasoning_effort, timeout_sec). None falls back to the
+    recommended defaults in providers.recommended_settings().
 
     Synchronous — call from a worker thread.
     """
@@ -954,6 +959,7 @@ def generate_brief(
         narrative = call_provider(
             provider, api_key, model, system_msg,
             [{"role": "user", "content": user_msg}],
+            options=options,
         )
     except AIError as e:
         return BriefResult(

@@ -23,13 +23,14 @@ from PyQt6.QtCore import Qt, QObject, QThread, pyqtSignal, QDate
 from PyQt6.QtGui import QTextDocument, QPageLayout, QPageSize
 from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDateEdit, QFileDialog, QFrame, QHBoxLayout,
-    QLabel, QMessageBox, QPushButton, QTextBrowser, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QSpinBox, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from app.ai.brief import BriefResult, gather_brief_data, generate_brief
 from app.ai.brief_renderer import render_to_html
-from app.ai.providers import DEFAULT_MODELS
+from app.ai.providers import DEFAULT_MODELS, recommended_settings
 from app.data import store
 from app.services.metrics_service import DatasetBundle
 import app.ui.theme as theme
@@ -51,23 +52,163 @@ class _BriefWorker(QObject):
     error    = pyqtSignal(str)
 
     def __init__(self, target_date: date, bundle: DatasetBundle,
-                 provider: str, api_key: str, model: str):
+                 provider: str, api_key: str, model: str,
+                 options: Optional[dict] = None):
         super().__init__()
         self._target = target_date
         self._bundle = bundle
         self._provider = provider
         self._api_key = api_key
         self._model = model
+        self._options = options
 
     def run(self) -> None:
         try:
             result = generate_brief(
                 self._target, self._bundle,
                 self._provider, self._api_key, self._model,
+                options=self._options,
             )
             self.finished.emit(result)
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"{type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Advanced reasoning settings dialog
+# ---------------------------------------------------------------------------
+
+class _AdvancedAIDialog(QDialog):
+    """Per-model reasoning controls — max tokens, reasoning effort, timeout."""
+
+    def __init__(self, parent: QWidget, provider: str, model: str):
+        super().__init__(parent)
+        self._provider = provider
+        self._model = model
+        self._rec = recommended_settings(provider, model)
+        saved = store.get_model_overrides(provider, model)
+
+        self.setWindowTitle("Advanced — Reasoning Settings")
+        self.setMinimumWidth(460)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 14, 16, 12)
+        outer.setSpacing(10)
+
+        # ---- Header ------------------------------------------------------
+        hdr = QLabel(f"<b>{provider} · {model}</b>")
+        hdr.setStyleSheet("font-size: 13px;")
+        outer.addWidget(hdr)
+
+        kind = "Reasoning model" if self._rec.get("is_reasoning") else "Standard chat model"
+        sub = QLabel(
+            f"<span style='color:{theme.get('text_muted')};'>"
+            f"{kind} · adjust limits below if you hit timeouts or empty replies."
+            "</span>"
+        )
+        sub.setWordWrap(True)
+        outer.addWidget(sub)
+
+        # ---- Form --------------------------------------------------------
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # Max output tokens
+        self._tok_spin = QSpinBox()
+        self._tok_spin.setRange(500, 128000)
+        self._tok_spin.setSingleStep(500)
+        self._tok_spin.setSuffix(" tokens")
+        self._tok_spin.setValue(int(saved.get("max_tokens", self._rec["max_tokens"])))
+        tok_help = QLabel(
+            f"<span style='color:{theme.get('text_muted')};font-size:11px;'>"
+            f"Recommended: <b>{self._rec['max_tokens']:,}</b>"
+            + (" — reasoning + visible reply share this budget."
+               if self._rec.get("is_reasoning") else "")
+            + "</span>"
+        )
+        form.addRow("Max output tokens:", self._tok_spin)
+        form.addRow("", tok_help)
+
+        # Reasoning effort
+        levels = self._rec.get("effort_levels") or []
+        self._eff_combo = QComboBox()
+        if levels:
+            self._eff_combo.addItems(levels)
+            current = saved.get("reasoning_effort") or self._rec.get("reasoning_effort") or levels[0]
+            idx = self._eff_combo.findText(str(current))
+            if idx >= 0:
+                self._eff_combo.setCurrentIndex(idx)
+            self._eff_combo.setEnabled(True)
+        else:
+            self._eff_combo.addItem("(not supported)")
+            self._eff_combo.setEnabled(False)
+        eff_help_txt = (
+            f"Recommended: <b>{self._rec.get('reasoning_effort')}</b> · "
+            "lower = faster + more tokens for visible reply."
+            if self._rec.get("is_reasoning")
+            else "Only available on gpt-5 and o-series models."
+        )
+        eff_help = QLabel(
+            f"<span style='color:{theme.get('text_muted')};font-size:11px;'>"
+            f"{eff_help_txt}</span>"
+        )
+        form.addRow("Reasoning effort:", self._eff_combo)
+        form.addRow("", eff_help)
+
+        # Timeout
+        self._to_spin = QSpinBox()
+        self._to_spin.setRange(30, 7200)
+        self._to_spin.setSingleStep(30)
+        self._to_spin.setSuffix(" sec")
+        self._to_spin.setValue(int(saved.get("timeout_sec", self._rec["timeout_sec"])))
+        to_help = QLabel(
+            f"<span style='color:{theme.get('text_muted')};font-size:11px;'>"
+            f"Recommended: <b>{self._rec['timeout_sec']} sec</b> "
+            f"({self._rec['timeout_sec']//60} min) · raise if requests time out."
+            "</span>"
+        )
+        form.addRow("HTTP read timeout:", self._to_spin)
+        form.addRow("", to_help)
+
+        outer.addLayout(form)
+
+        # ---- Save-as-default checkbox -----------------------------------
+        self._save_chk = QCheckBox(f"Save as default for {model}")
+        self._save_chk.setChecked(bool(saved))
+        outer.addWidget(self._save_chk)
+
+        # ---- Buttons -----------------------------------------------------
+        btns = QDialogButtonBox()
+        self._reset_btn = btns.addButton("Reset to recommended",
+                                         QDialogButtonBox.ButtonRole.ResetRole)
+        cancel_btn = btns.addButton(QDialogButtonBox.StandardButton.Cancel)
+        ok_btn = btns.addButton("Apply", QDialogButtonBox.ButtonRole.AcceptRole)
+        ok_btn.setDefault(True)
+        self._reset_btn.clicked.connect(self._reset)
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn.clicked.connect(self.accept)
+        outer.addWidget(btns)
+
+    def _reset(self) -> None:
+        self._tok_spin.setValue(int(self._rec["max_tokens"]))
+        self._to_spin.setValue(int(self._rec["timeout_sec"]))
+        if self._eff_combo.isEnabled() and self._rec.get("reasoning_effort"):
+            idx = self._eff_combo.findText(self._rec["reasoning_effort"])
+            if idx >= 0:
+                self._eff_combo.setCurrentIndex(idx)
+
+    def options(self) -> dict:
+        opts: dict = {
+            "max_tokens": int(self._tok_spin.value()),
+            "timeout_sec": int(self._to_spin.value()),
+        }
+        if self._eff_combo.isEnabled():
+            opts["reasoning_effort"] = self._eff_combo.currentText()
+        return opts
+
+    def save_as_default(self) -> bool:
+        return self._save_chk.isChecked()
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +224,9 @@ class BriefTab(QWidget):
         self._last_kpis: dict = {}
         self._thread: Optional[QThread] = None
         self._worker: Optional[_BriefWorker] = None
+        # One-shot per-run override (cleared after each run); when None, the
+        # saved per-model defaults from store.get_model_overrides() are used.
+        self._pending_options: Optional[dict] = None
 
         self._build_ui()
         self._load_provider_config()
@@ -152,6 +296,25 @@ class BriefTab(QWidget):
         self._model_combo.setMinimumWidth(180)
         self._model_combo.currentTextChanged.connect(self._on_model_changed)
         bl.addWidget(self._model_combo)
+
+        self._btn_advanced = QPushButton("⚙")
+        self._btn_advanced.setToolTip("Advanced — reasoning model settings")
+        self._btn_advanced.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_advanced.setFixedWidth(36)
+        self._btn_advanced.setMinimumHeight(30)
+        self._btn_advanced.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,0.18);
+                color: white;
+                border: 1px solid rgba(255,255,255,0.35);
+                border-radius: 5px;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background: rgba(255,255,255,0.32); }
+        """)
+        self._btn_advanced.clicked.connect(self._open_advanced)
+        bl.addWidget(self._btn_advanced)
 
         self._btn_generate = QPushButton("✨ Generate Brief")
         self._btn_generate.setMinimumHeight(34)
@@ -266,6 +429,36 @@ class BriefTab(QWidget):
         cfg["model"]    = self._model_combo.currentText().strip()
         store.set_ai_config(cfg)
 
+    # ------------------------------------------------------------------ Advanced
+    def _open_advanced(self) -> None:
+        provider = self._provider_combo.currentText()
+        model    = self._model_combo.currentText().strip() or DEFAULT_MODELS.get(provider, "")
+        if not model:
+            QMessageBox.information(self, "Pick a model",
+                                    "Choose a model first, then open Advanced.")
+            return
+        dlg = _AdvancedAIDialog(self, provider, model)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            opts = dlg.options()
+            if dlg.save_as_default():
+                store.set_model_overrides(provider, model, opts)
+                self._pending_options = None  # saved defaults will apply
+                self._status.setText(
+                    f"⚙ Saved {model} defaults — "
+                    f"{opts['max_tokens']:,} tokens · {opts['timeout_sec']}s"
+                    + (f" · effort={opts.get('reasoning_effort')}"
+                       if 'reasoning_effort' in opts else "")
+                )
+            else:
+                # Apply for next run only
+                self._pending_options = opts
+                store.set_model_overrides(provider, model, None)
+                self._status.setText(
+                    f"⚙ Next run will use custom settings "
+                    f"({opts['max_tokens']:,} tokens · {opts['timeout_sec']}s)"
+                )
+            self._status.setStyleSheet(f"color: {theme.get('text_muted')};")
+
     # ------------------------------------------------------------------ Generate
     def _on_generate(self) -> None:
         if self._bundle is None or self._bundle.sku_metrics.empty:
@@ -296,10 +489,16 @@ class BriefTab(QWidget):
         qd = self._date.date()
         target_date = date(qd.year(), qd.month(), qd.day())
 
+        # Resolve generation options: one-shot pending overrides win, else
+        # the per-model saved defaults, else None (use recommended_settings).
+        options = self._pending_options or store.get_model_overrides(provider, model) or None
+        self._pending_options = None  # one-shot consumed
+
         self._set_busy(True, f"Generating brief for {target_date.isoformat()}…")
 
         self._thread = QThread(self)
-        self._worker = _BriefWorker(target_date, self._bundle, provider, api_key, model)
+        self._worker = _BriefWorker(target_date, self._bundle, provider, api_key, model,
+                                    options=options)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_brief_ready)

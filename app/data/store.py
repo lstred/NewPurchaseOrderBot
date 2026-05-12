@@ -317,6 +317,55 @@ def set_ai_config(cfg: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# AI per-model generation overrides (max_tokens / reasoning_effort / timeout)
+# Stored as: { "openai::gpt-5": {"max_tokens": 16000, ...}, ... }
+# ---------------------------------------------------------------------------
+
+_AI_OVERRIDES_FILE = APPDATA_DIR / "ai_model_overrides.json"
+
+_OVR_KEYS = ("max_tokens", "reasoning_effort", "timeout_sec")
+
+
+def _ovr_key(provider: str, model: str) -> str:
+    return f"{(provider or '').lower()}::{(model or '').strip()}"
+
+
+def get_model_overrides(provider: str, model: str) -> dict:
+    """Return saved overrides for this provider+model (empty dict if none)."""
+    data = _load(_AI_OVERRIDES_FILE)
+    raw = data.get(_ovr_key(provider, model)) or {}
+    out: dict = {}
+    for k in _OVR_KEYS:
+        if k in raw and raw[k] not in (None, ""):
+            out[k] = raw[k]
+    return out
+
+
+def set_model_overrides(provider: str, model: str, overrides: dict | None) -> None:
+    """Persist overrides for provider+model. Pass empty/None to clear."""
+    data = _load(_AI_OVERRIDES_FILE)
+    key = _ovr_key(provider, model)
+    clean: dict = {}
+    if overrides:
+        for k in _OVR_KEYS:
+            v = overrides.get(k)
+            if v in (None, ""):
+                continue
+            if k == "reasoning_effort":
+                clean[k] = str(v)
+            else:
+                try:
+                    clean[k] = int(v)
+                except (TypeError, ValueError):
+                    continue
+    if clean:
+        data[key] = clean
+    elif key in data:
+        del data[key]
+    _save(_AI_OVERRIDES_FILE, data)
+
+
+# ---------------------------------------------------------------------------
 # AI knowledge base / memory notes
 # (Saved-query helpers were removed in v4.0 along with the Q&A AI tab.)
 # ---------------------------------------------------------------------------
