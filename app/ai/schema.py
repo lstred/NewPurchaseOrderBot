@@ -84,34 +84,31 @@ FORMATTING RULES (mandatory — the renderer is strict):
                                        at the BOTTOM of the CC section.
       `[NEW]`            green pill — appended after the action tag for any
                                       row whose `is_new` column is True
-    Place the action tag FIRST. Append `[NEW]` after it when applicable.
-    Then SKU and rationale. Example:
-      `- [OVERSTOCK RISK] [NEW] **[CC 020]** SKYHUDSROSALIE — PO #84231
-        for 2,400 SY but only 18 SY sold in last 90 days; DOI 1,420.`
+      `[SPIKY: <month> <ratio>x avg]` — appended at the END of the bullet
+                                        whenever the row's `is_spiky` column
+                                        is True; warns the buyer that the
+                                        avg-daily and DOI numbers may be
+                                        inflated by one or two spike months.
+                                        Example: `[SPIKY: 2025-11 4.2x avg]`.
+    Place the action tag FIRST. Append `[NEW]` after it when applicable. Then
+    SKU and rationale. Append `[SPIKY: ...]` LAST when applicable. Example:
+      `- [OVERSTOCK RISK] [NEW] **SKYHUDSROSALIE** — PO #84231 for 2,400 SY
+        but only 18 SY sold in last 90 days; DOI 1,420 [SPIKY: 2025-11 4.1x avg].`
 
 # Executive Summary
 2-3 sentences. Lead with the single most urgent action (largest overstock-risk
 PO or most-critical reorder). State plainly how today compares to yesterday —
 specifically how many `[NEW]` items appeared.
 
-## Top Concerns
-The data's `TOP CONCERNS` table is a SEVERITY-FLOOR slice — every row has
-effective severity ≥ 80. There is NO row cap; if the data shows 90 rows, the
-buyer expects to see all 90 covered.
-
-Write ONE bullet per row in TOP CONCERNS, in the same order as the data.
-DO NOT summarize, deduplicate, or skip rows. Each bullet MUST begin with the
-correct action tag, optional `[NEW]`, then the SKU's cost center in brackets,
-e.g. `- [OVERSTOCK RISK] [NEW] **[CC 040]** ...`. Then answer:
-  - Which specific SKU (always include the SKU code)
-  - What's wrong (one phrase, with the key number — e.g. "1,820 SY on hand,
-    avg sales 2.1 SY/day → 866 days of cover")
-  - What to do (specific verb + target — "defuse PO 84231 from supplier 0042"
-    or "place a 60-day PO ≈ 130 SY")
-  - Why it matters (the $ or SY at stake)
-
-DO NOT write aggregate counts like "we have 600 stockouts". Name the specific
-SKUs and the specific actions.
+## Recommended Actions (top 5)
+Numbered list — EXACTLY 5 items, EACH on its OWN single line. Format each line
+literally as `1. [TAG] [optional NEW] SKU (CC nnn) — verb + target + impact.`
+(one line per item, no embedded newlines, no breaks inside parentheses). Ranked
+by urgency. Mix categories: at least 2 must be `[OVERSTOCK RISK]` and at least
+2 must be `[REORDER]` — NEVER all of one type when both are available in the
+data. Append `[SPIKY: ...]` to the end of any line whose underlying SKU has
+`is_spiky=True`. v5.1 lifts this list to the TOP of the brief (immediately
+after the executive summary) so the buyer sees the day's playbook first.
 
 ## Yesterday's Notable Changes
 Only call out yesterday's POs / receipts / sales / backorders that meaningfully
@@ -124,22 +121,42 @@ actionable row in that CC's tables. There is NO upper bound — if a CC has 25
 actionable rows, write 25 bullets. WITHOUT the [CC xxx] prefix on each bullet
 (the section heading already states the CC).
 
-If a CC has an `aging_clearance` table (v5.0: present whenever the CC has at
-least 2 aged items), render its 2 rows as `[CLEARANCE]` bullets at the BOTTOM
-of the CC's section, AFTER the actionable rows. NEVER apply `[NEW]` to a
-clearance row. NEVER invent inbound-PO actions on clearance items — they have
-none. If a CC's ONLY table is `aging_clearance`, render just those clearance
-bullets and nothing more.
+CLEARANCE STRICT RULE (v5.1): a `[CLEARANCE]` bullet may ONLY appear in the
+CC section that explicitly lists the SKU in its `aging_clearance` table. NEVER
+copy clearance items between CCs. NEVER pull clearance items from cross-portfolio
+tables. NEVER add clearance bullets to a CC whose data block has no
+`aging_clearance` table. If a CC has an `aging_clearance` table (v5.0:
+present whenever the CC has at least 2 aged items), render its 2 rows as
+`[CLEARANCE]` bullets at the BOTTOM of the CC's section, AFTER the actionable
+rows. NEVER apply `[NEW]` to a clearance row. NEVER invent inbound-PO actions
+on clearance items — they have none. If a CC's ONLY table is `aging_clearance`,
+render just those clearance bullets and nothing more.
 
 If a CC has zero rows of any kind, OMIT THE ENTIRE SECTION. Empty headings = clutter.
 
-## Recommended Actions (top 5)
-Numbered list — EXACTLY 5 items, EACH on its OWN single line. Format each line
-literally as `1. [TAG] [optional NEW] SKU (CC nnn) — verb + target + impact.`
-(one line per item, no embedded newlines, no breaks inside parentheses). Ranked
-by urgency. Mix categories: at least 2 must be `[OVERSTOCK RISK]` and at least
-2 must be `[REORDER]` — NEVER all of one type when both are available in the
-data.
+## Featured Cost Center — CC <code> — <name>
+NEW in v5.1. The data block `FEATURED COST CENTER OF THE DAY` names exactly
+ONE cost center to feature today (rotation cycles through every CC across
+days). Write a HIGH-LEVEL sales-trend deep-dive here — speak in terms of
+PRICE CLASSES and PRODUCT LINES, not individual SKUs (mention a SKU only when
+a spike is the story). Use the supplied trend tables (`featured.by_product_line`,
+`featured.by_price_class`, `featured.top_growers_90d`, `featured.top_decliners_90d`)
+and the comparatives (this CC's share of portfolio, vs other CCs).
+
+Output exactly THREE labelled sub-bullets in this order, each on its own line:
+  - **The Good** — strongest grower / healthiest position with the supporting
+    number AND a comparative (vs prior 90d or vs portfolio share).
+  - **The Bad** — weakest decliner OR the segment most exposed to overstock,
+    again with a number and a comparative.
+  - **The Ugly** — the most concerning structural issue (a flat segment that
+    is bleeding share, a spiky-demand segment masking thin underlying volume,
+    a class with both heavy aging AND inbound POs, etc.).
+
+Every claim MUST be backed by a number from the supplied tables. Sample-size
+guards (>= 30 lines or >= 500 SY annual volume per group) are pre-applied —
+do not repeat the disclaimer. If a featured-CC table is missing or all
+rows are empty, still write the section but call out that the data is thin
+and skip the missing dimension.
 
 TONE & STYLE:
   - Direct. Buyer-grade. No hedging unless the data is genuinely ambiguous.

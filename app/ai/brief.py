@@ -32,7 +32,11 @@ from sqlalchemy import text
 from app.ai.providers import call_provider, AIError, DEFAULT_MODELS
 from app.ai.schema import build_brief_system_prompt
 from app.data.db import read_dataframe
-from app.data.store import get_prev_brief_snapshot, save_brief_snapshot
+from app.data.store import (
+    get_next_featured_cc,
+    get_prev_brief_snapshot,
+    save_brief_snapshot,
+)
 from app.services.metrics_service import DatasetBundle
 
 
@@ -88,6 +92,14 @@ class BriefData:
     # Per-cost-center breakdown — only CCs with at least one concern populated
     # Shape: { cc_code: { 'name': str, 'kpis': dict, 'tables': { table_name: DataFrame } } }
     cost_center_problems: dict = field(default_factory=dict)
+    # v5.1 — featured cost center of the day (rotates daily through all CCs).
+    # Shape: { 'cc': str, 'name': str, 'kpis': dict, 'tables': { name: DataFrame } }
+    featured_cost_center: dict = field(default_factory=dict)
+    # v5.1 — set of base SKUs whose 12-month sales history has a single month
+    # > 3x the SKU's mean monthly volume (sample size >= 6 months, max month
+    # >= 50 SY). Surfaced as a `[SPIKY]` tag so the buyer knows the average
+    # daily / DOI numbers may be inflated by one-time orders.
+    spiky_skus: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -473,9 +485,18 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
     # ------------------------------ NEW v4.2 actionable metrics ------------------------------
     _build_actionable_metrics(data, sm, bundle, target_date)
 
+    # v5.1 \u2014 detect SKUs whose 12-month sales history is dominated by a single
+    # spike month (> 3x mean monthly volume). The flag rides on the actionable
+    # tables so the AI can surface a `[SPIKY]` warning.
+    data.spiky_skus = _compute_spiky_skus(bundle, target_date)
+    _annotate_spiky(data)
+
     # ------------------------------ Top concerns + per-CC grouping ------------------------------
     data.top_concerns = _build_top_concerns(data, sm)
     data.cost_center_problems = _build_cost_center_breakdown(data, sm)
+
+    # v5.1 \u2014 featured cost center of the day (rotates daily through all CCs).
+    data.featured_cost_center = _build_featured_cost_center(data, sm, bundle, target_date)
 
     # v4.8 \u2014 mark concerns that are NEW since the previous brief so the buyer
     # can recognise fresh items at a glance. Then persist today's snapshot.
@@ -529,6 +550,301 @@ def _persist_snapshot(data: BriefData, target_date: date) -> None:
     except Exception:
         # Snapshot persistence is best-effort \u2014 never let it break the brief.
         pass
+
+
+# ---------------------------------------------------------------------------
+# Deeper actionable metrics (v4.2)
+# ---------------------------------------------------------------------------
+
+# v5.1 — spiky-month detection thresholds.
+_SPIKY_MIN_MONTHS         = 6      # need >=6 distinct months of sales history
+_SPIKY_MIN_MAX_MONTH_QTY  = 50.0   # noise floor on the largest month (SY)
+_SPIKY_RATIO              = 3.0    # spike > 3x average month
+_SPIKY_LOOKBACK_DAYS      = 365
+
+
+def _compute_spiky_skus(bundle: DatasetBundle, target_date: date) -> dict:
+    """Identify SKUs dominated by a single spike month over the trailing year.
+
+    Returns ``{base_sku: {spike_month, spike_qty, mean_qty, ratio, months}}``.
+    Used downstream by `_annotate_spiky` to set a per-row ``is_spiky`` flag.
+    """
+    if bundle.orders is None or bundle.orders.empty:
+        return {}
+    if "order_entry_date" not in bundle.orders.columns:
+        return {}
+    cutoff = target_date - timedelta(days=_SPIKY_LOOKBACK_DAYS)
+    od = bundle.orders
+    od = od[
+        (od["order_entry_date"] >= cutoff)
+        & (od["order_entry_date"] <= target_date)
+        & (~od.get("backorder_flag", False))
+        & (od["quantity_sy"].fillna(0) > 0)
+    ]
+    if od.empty:
+        return {}
+    od = od.assign(
+        ym=pd.to_datetime(od["order_entry_date"]).dt.to_period("M").astype(str),
+        base_sku=od["base_sku"].astype(str).str.strip(),
+    )
+    monthly = od.groupby(["base_sku", "ym"])["quantity_sy"].sum().reset_index()
+    if monthly.empty:
+        return {}
+    stats = (
+        monthly.groupby("base_sku")
+        .agg(
+            months=("ym", "nunique"),
+            max_qty=("quantity_sy", "max"),
+            mean_qty=("quantity_sy", "mean"),
+        )
+        .reset_index()
+    )
+    spiky = stats[
+        (stats["months"] >= _SPIKY_MIN_MONTHS)
+        & (stats["max_qty"] >= _SPIKY_MIN_MAX_MONTH_QTY)
+        & (stats["max_qty"] > _SPIKY_RATIO * stats["mean_qty"])
+        & (stats["mean_qty"] > 0)
+    ].copy()
+    if spiky.empty:
+        return {}
+    # Pull the spike month label per SKU.
+    idx = monthly.groupby("base_sku")["quantity_sy"].idxmax()
+    peak = monthly.loc[idx].set_index("base_sku")
+    out: dict = {}
+    for _, r in spiky.iterrows():
+        sku = str(r["base_sku"])
+        spike_month = peak.at[sku, "ym"] if sku in peak.index else ""
+        spike_qty = float(peak.at[sku, "quantity_sy"]) if sku in peak.index else float(r["max_qty"])
+        mean_qty = float(r["mean_qty"])
+        out[sku] = {
+            "spike_month": str(spike_month),
+            "spike_qty":   spike_qty,
+            "mean_qty":    mean_qty,
+            "ratio":       (spike_qty / mean_qty) if mean_qty > 0 else 0.0,
+            "months":      int(r["months"]),
+        }
+    return out
+
+
+def _annotate_spiky(data: BriefData) -> None:
+    """Attach `is_spiky` / `spike_month` / `spike_ratio` columns to every
+    actionable table whose action depends on avg-daily volume (the figure a
+    spike distorts).  Touches needs_reorder + the two overstock tables.
+    """
+    sset = data.spiky_skus or {}
+    if not sset:
+        return
+
+    def _mark(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty or "sku" not in df.columns:
+            return df
+        df = df.copy()
+        skus = df["sku"].astype(str)
+        df["is_spiky"]    = skus.isin(sset.keys())
+        df["spike_month"] = skus.map(lambda s: (sset.get(s) or {}).get("spike_month", ""))
+        df["spike_ratio"] = skus.map(
+            lambda s: round(float((sset.get(s) or {}).get("ratio", 0.0)), 1)
+        )
+        return df
+
+    data.needs_reorder_no_po    = _mark(data.needs_reorder_no_po)
+    data.excessive_incoming_pos = _mark(data.excessive_incoming_pos)
+    data.massive_overstock      = _mark(data.massive_overstock)
+    data.redflag_new_pos        = _mark(data.redflag_new_pos)
+
+
+# ---------------------------------------------------------------------------
+# Featured Cost Center (v5.1) — one CC per day, cycling through every CC.
+# ---------------------------------------------------------------------------
+
+# Sample-size guards — nothing is "featured" off a flukey order or two.
+_FEATURED_GROUP_MIN_LINES = 30      # >=30 order lines per group (price class / product line)
+_FEATURED_GROUP_MIN_QTY   = 500.0   # OR >=500 SY annual volume per group
+
+
+def _build_featured_cost_center(
+    data: BriefData,
+    sm: pd.DataFrame,
+    bundle: DatasetBundle,
+    target_date: date,
+) -> dict:
+    """Pick today's featured CC and assemble high-level sales-trend tables.
+
+    Returns ``{ 'cc': str, 'name': str, 'kpis': dict, 'tables': {name: DataFrame},
+    'comparatives': dict }``.  Empty dict if no usable CCs.
+    """
+    if sm.empty or "cost_center" not in sm.columns:
+        return {}
+    cc_series = sm["cost_center"].astype(str).str.strip()
+    all_ccs = sorted({cc for cc in cc_series.unique() if cc and cc.lower() != "nan"})
+    if not all_ccs:
+        return {}
+    cc = get_next_featured_cc(target_date, all_ccs)
+    if not cc:
+        return {}
+    cc_mask = cc_series == cc
+    cc_sm = sm[cc_mask]
+    if cc_sm.empty:
+        return {}
+    cc_name = ""
+    if "cost_center_desc" in sm.columns:
+        names = cc_sm["cost_center_desc"].astype(str)
+        if not names.empty:
+            cc_name = str(names.iloc[0]).strip()
+    if not cc_name and bundle.orders is not None and "cost_center_desc" in bundle.orders.columns:
+        oc = bundle.orders[bundle.orders["cost_center"].astype(str).str.strip() == cc]
+        if not oc.empty:
+            cc_name = str(oc["cost_center_desc"].iloc[0]).strip()
+
+    out: dict = {"cc": cc, "name": cc_name, "tables": {}, "kpis": {}, "comparatives": {}}
+
+    # ---- KPIs --------------------------------------------------------------
+    out["kpis"] = {
+        "skus":          int(len(cc_sm)),
+        "inventory_sy":  float(cc_sm["inventory_sy"].sum()),
+        "on_order_sy":   float(cc_sm["on_order_sy"].sum()),
+        "avg_doi":       float(cc_sm["days_of_inventory"].replace(
+                              [float("inf"), float("-inf")], None
+                          ).dropna().median() or 0.0),
+        "stockouts":     int(cc_sm["stockout_flag"].sum()),
+        "overstock":     int(cc_sm["overstock_flag"].sum()),
+        "aged_365":      int(((cc_sm["inventory_age_days"] >= 365)
+                              & (cc_sm["inventory_sy"] > 0)).sum()),
+    }
+
+    # ---- Sales trend by attribute (last 90 / 365 days) ---------------------
+    od = bundle.orders
+    if od is not None and not od.empty and "order_entry_date" in od.columns:
+        cut365 = target_date - timedelta(days=365)
+        cut90  = target_date - timedelta(days=90)
+        cut180 = target_date - timedelta(days=180)
+        od = od[
+            (od["order_entry_date"] >= cut365)
+            & (od["order_entry_date"] <= target_date)
+            & (~od.get("backorder_flag", False))
+            & (od["quantity_sy"].fillna(0) > 0)
+        ].copy()
+        if not od.empty:
+            # Bring in attribute columns from sm for grouping.
+            attr_cols = ["sku", "price_class", "price_class_desc", "product_line", "product_line_desc"]
+            attr_cols = [c for c in attr_cols if c in sm.columns]
+            attrs = sm[attr_cols].drop_duplicates("sku")
+            od = od.merge(attrs, left_on="base_sku", right_on="sku", how="left")
+            od["cc"] = od["cost_center"].astype(str).str.strip()
+            cc_orders = od[od["cc"] == cc]
+            other_orders = od[od["cc"] != cc]
+
+            def _trend_table(group_col: str, label_col: str | None) -> pd.DataFrame:
+                if group_col not in cc_orders.columns or cc_orders[group_col].isna().all():
+                    return pd.DataFrame()
+                g = cc_orders.copy()
+                g[group_col] = g[group_col].astype(str).str.strip().replace({"": "(blank)"})
+                if label_col and label_col in g.columns:
+                    g[label_col] = g[label_col].astype(str).str.strip()
+                # 90d / 180d / 365d quantity buckets.
+                def _bucket(start_date, df):
+                    return (
+                        df[df["order_entry_date"] >= start_date]
+                        .groupby(group_col)["quantity_sy"].sum()
+                    )
+                qty_90  = _bucket(cut90, g).rename("qty_90d")
+                qty_180 = _bucket(cut180, g).rename("qty_180d")
+                qty_365 = _bucket(cut365, g).rename("qty_365d")
+                lines_365 = g.groupby(group_col)["order_line_id"].nunique().rename("lines_365d")
+                tbl = pd.concat([qty_90, qty_180, qty_365, lines_365], axis=1).fillna(0).reset_index()
+                # Sample-size guard (fluke filter).
+                tbl = tbl[
+                    (tbl["lines_365d"] >= _FEATURED_GROUP_MIN_LINES)
+                    | (tbl["qty_365d"] >= _FEATURED_GROUP_MIN_QTY)
+                ]
+                if tbl.empty:
+                    return tbl
+                # Trailing trend: prior-90d (days 91-180) vs latest-90d.
+                tbl["qty_prior_90d"] = (tbl["qty_180d"] - tbl["qty_90d"]).clip(lower=0)
+                tbl["trend_pct"] = (
+                    (tbl["qty_90d"] - tbl["qty_prior_90d"])
+                    / tbl["qty_prior_90d"].where(tbl["qty_prior_90d"] > 0)
+                ) * 100.0
+                tbl["trend_pct"] = tbl["trend_pct"].round(0).fillna(0.0)
+                # Attach a friendly label if available.
+                if label_col and label_col in g.columns:
+                    label_map = (
+                        g.groupby(group_col)[label_col].first()
+                        .replace({"": None}).dropna().to_dict()
+                    )
+                    tbl["label"] = tbl[group_col].map(label_map).fillna("")
+                else:
+                    tbl["label"] = ""
+                # Compare to portfolio (other CCs) on the same group.
+                other_qty_365 = (
+                    other_orders.groupby(group_col)["quantity_sy"].sum()
+                    if group_col in other_orders.columns else pd.Series(dtype="float64")
+                )
+                tbl["other_ccs_qty_365d"] = tbl[group_col].map(other_qty_365).fillna(0.0)
+                tbl["share_of_total"] = (
+                    tbl["qty_365d"]
+                    / (tbl["qty_365d"] + tbl["other_ccs_qty_365d"]).replace(0, pd.NA)
+                ).round(3)
+                tbl = tbl.sort_values("qty_365d", ascending=False).head(15).reset_index(drop=True)
+                # Round numerics for display.
+                for c in ("qty_90d", "qty_180d", "qty_365d", "qty_prior_90d", "other_ccs_qty_365d"):
+                    tbl[c] = tbl[c].round(0)
+                return tbl
+
+            pl_table = _trend_table("product_line", "product_line_desc")
+            pc_table = _trend_table("price_class",  "price_class_desc")
+            if not pl_table.empty:
+                out["tables"]["by_product_line"] = pl_table
+            if not pc_table.empty:
+                out["tables"]["by_price_class"]  = pc_table
+
+            # Top growers / decliners across ALL groups (combined view).
+            combined = []
+            for tname in ("by_product_line", "by_price_class"):
+                if tname in out["tables"]:
+                    t = out["tables"][tname].copy()
+                    t["dimension"] = "product_line" if tname == "by_product_line" else "price_class"
+                    combined.append(t)
+            if combined:
+                full = pd.concat(combined, ignore_index=True)
+                # Need a meaningful sample on both halves of the comparison.
+                full = full[(full["qty_prior_90d"] >= 100) | (full["qty_90d"] >= 100)]
+                if not full.empty:
+                    growers = full.sort_values("trend_pct", ascending=False).head(5)
+                    decliners = full.sort_values("trend_pct", ascending=True).head(5)
+                    out["tables"]["top_growers_90d"]   = growers.reset_index(drop=True)
+                    out["tables"]["top_decliners_90d"] = decliners.reset_index(drop=True)
+
+            # Aggregate comparatives: this CC's annual qty vs the portfolio.
+            cc_total_365 = float(cc_orders["quantity_sy"].sum())
+            other_total_365 = float(other_orders["quantity_sy"].sum())
+            grand_total = cc_total_365 + other_total_365
+            out["comparatives"] = {
+                "cc_qty_365d":     round(cc_total_365, 0),
+                "portfolio_qty_365d": round(grand_total, 0),
+                "cc_share_pct":    round(100.0 * cc_total_365 / grand_total, 1) if grand_total > 0 else 0.0,
+                "cc_lines_365d":   int(cc_orders["order_line_id"].nunique()),
+            }
+
+    # ---- Spiky SKUs that live in this CC ----------------------------------
+    spiky = data.spiky_skus or {}
+    if spiky:
+        cc_skus = set(cc_sm["sku"].astype(str))
+        sp_rows = []
+        for sku, info in spiky.items():
+            if sku in cc_skus:
+                sp_rows.append({
+                    "sku":         sku,
+                    "spike_month": info.get("spike_month", ""),
+                    "spike_qty":   round(float(info.get("spike_qty", 0)), 0),
+                    "mean_qty":    round(float(info.get("mean_qty", 0)), 1),
+                    "ratio":       round(float(info.get("ratio", 0)), 1),
+                })
+        if sp_rows:
+            sp_df = pd.DataFrame(sp_rows).sort_values("ratio", ascending=False).head(10).reset_index(drop=True)
+            out["tables"]["spiky_skus_in_cc"] = sp_df
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -877,10 +1193,10 @@ def build_brief_prompt(data: BriefData) -> str:
     Structure (must mirror schema.py output requirements):
       1. Filter scope disclosure
       2. Portfolio snapshot
-      3. TOP CONCERNS (cross-portfolio, ranked) — the lead of the brief
-      4. Yesterday's activity (POs / receipts / sales / backorders)
-      5. Per-cost-center problem tables (only CCs with concerns)
-      6. Full problem tables (cross-portfolio fallback context)
+      3. Yesterday's activity (POs / receipts / sales / backorders)
+      4. Per-cost-center problem tables (only CCs with concerns)
+      5. Featured cost center of the day (rotates daily)
+      6. Cross-portfolio supporting tables (raw — for reference only)
     """
     k = data.portfolio_kpis
     fs = data.filter_summary
@@ -909,26 +1225,16 @@ def build_brief_prompt(data: BriefData) -> str:
         f"| Aged >= 365d: {k.get('aging_365d_skus', 0)}\n"
     )
 
-    # --- TOP CONCERNS (the lead) -------------------------------------------------
+    # v5.1 — SPIKY tag explainer (replaces the v5.0 TOP CONCERNS block).
     sections.append(
-        "\n## TOP CONCERNS (v5.0 — only buyer-actionable items)\n"
-        "Every row is one of TWO action types:\n"
-        "  - `incoming_overstock` / `redflag_new_po`: an OPEN, valid PO is\n"
-        "    pushing days-of-inventory past its overstock floor (700d for\n"
-        "    slow-LT items > 99-day lead time, 365d for fast-LT items).\n"
-        "    Flag as OVERSTOCK RISK.\n"
-        "  - `needs_reorder`: active demand with no valid PO on the books —\n"
-        "    the buyer must place a NEW PO.\n"
-        "Pure on-hand overstock without inbound is intentionally NOT in this\n"
-        "list (no buyer action available beyond markdown). Late-PO/expedite\n"
-        "items are also excluded — lead time is fixed; if a bridge buy is\n"
-        "needed it surfaces via needs_reorder. Placeholder POs with 1-2 char\n"
-        "order numbers were stripped upstream.\n"
-        "\n`is_new` column = True if this SKU did not appear in the previous\n"
-        "day's brief. Render `[NEW]` immediately after the action tag for those\n"
-        "rows so the buyer can spot fresh items vs the usual offenders.\n"
-        "DO NOT skip rows.\n\n"
-        + _df_to_compact_table(data.top_concerns, max_rows=150)
+        "\n## SPIKY-SKU MARKER (v5.1 — important)\n"
+        "Every actionable row carries an `is_spiky` boolean.  When True, the\n"
+        "SKU's last-12-months sales history is dominated by a single spike\n"
+        "month — `spike_qty` SY in `spike_month`, more than `spike_ratio`x\n"
+        "the SKU's average month.  In that case the avg-daily and DOI numbers\n"
+        "may be inflated by one or two big orders.  Append `[SPIKY: <month>\n"
+        "<ratio>x avg]` to the bullet so the buyer knows to sanity-check the\n"
+        "demand assumption before acting.\n"
     )
 
     # --- Yesterday's activity ----------------------------------------------------
@@ -961,6 +1267,12 @@ def build_brief_prompt(data: BriefData) -> str:
             "`aging_clearance` table. Render those as `[CLEARANCE]` bullets at\n"
             "the BOTTOM of the CC's section, after the actionable rows.\n"
             "NEVER add `[NEW]` badges to clearance rows.\n"
+            "STRICT v5.1 RULE: a `[CLEARANCE]` bullet may ONLY appear in the\n"
+            "CC section that explicitly lists the SKU in its `aging_clearance`\n"
+            "table.  NEVER copy clearance items between CCs, never invent\n"
+            "clearance bullets from the cross-portfolio tables, and never\n"
+            "add a clearance row to a CC whose breakdown has no\n"
+            "`aging_clearance` table at all.\n"
         )
         for cc_code in sorted(data.cost_center_problems.keys()):
             block = data.cost_center_problems[cc_code]
@@ -978,11 +1290,47 @@ def build_brief_prompt(data: BriefData) -> str:
             for tname, tdf in tables.items():
                 sections.append(f"\n#### {tname}\n" + _df_to_compact_table(tdf, max_rows=40))
 
+    # --- Featured Cost Center of the day (v5.1) ---------------------------------
+    fcc = data.featured_cost_center or {}
+    if fcc.get("cc"):
+        cc_code = fcc["cc"]
+        cc_name = fcc.get("name", "")
+        kpis = fcc.get("kpis") or {}
+        comp = fcc.get("comparatives") or {}
+        sections.append(
+            "\n## FEATURED COST CENTER OF THE DAY (v5.1)\n"
+            "One CC is featured each day, rotating through every CC in turn.\n"
+            "Use the tables below to write a HIGH-LEVEL sales-trend deep-dive\n"
+            "for this CC. Speak in terms of price classes and product lines —\n"
+            "NOT individual SKUs (unless a spike SKU is genuinely the story).\n"
+            "Every group below already passes a sample-size guard (>= 30 lines\n"
+            "or >= 500 SY annual volume), so the data is not flukey. Use the\n"
+            "comparatives to contextualise this CC vs the rest of the\n"
+            "portfolio. The schema mandates exactly THREE labelled insights:\n"
+            "**The Good**, **The Bad**, **The Ugly**.\n"
+        )
+        sections.append(
+            f"\n### FEATURED CC {cc_code}"
+            + (f" — {cc_name}" if cc_name else "")
+            + "\n"
+            f"KPIs: SKUs={kpis.get('skus', 0):,} | Inv={kpis.get('inventory_sy', 0):,.0f} SY "
+            f"| OnOrder={kpis.get('on_order_sy', 0):,.0f} SY | MedianDOI={kpis.get('avg_doi', 0):,.0f}d "
+            f"| Stockouts={kpis.get('stockouts', 0)} | Overstock={kpis.get('overstock', 0)} "
+            f"| Aged>=365d={kpis.get('aged_365', 0)}\n"
+            f"Trailing-365d sales: {comp.get('cc_qty_365d', 0):,.0f} SY across "
+            f"{comp.get('cc_lines_365d', 0):,} order lines  |  this CC = "
+            f"{comp.get('cc_share_pct', 0):.1f}% of the portfolio "
+            f"({comp.get('portfolio_qty_365d', 0):,.0f} SY total).\n"
+        )
+        for tname, tdf in (fcc.get("tables") or {}).items():
+            sections.append(f"\n#### featured.{tname}\n" + _df_to_compact_table(tdf, max_rows=20))
+
     # --- Cross-portfolio supporting tables (raw) --------------------------------
     sections.append(
         "\n## CROSS-PORTFOLIO SUPPORTING TABLES\n"
-        "Every table below is filtered to v5.0's two action buckets only.\n"
-        "Use them only if you need to verify or expand on the per-CC sections.\n"
+        "Reference data only — DO NOT render bullets directly from these tables.\n"
+        "Every actionable bullet must come from the per-CC breakdown above so\n"
+        "items always land under the correct cost center.\n"
     )
     sections.append("\n### RED-FLAG NEW POs (entered yesterday, push DOI past lead-time-aware floor)\n"
                     + _df_to_compact_table(data.redflag_new_pos))
@@ -993,14 +1341,8 @@ def build_brief_prompt(data: BriefData) -> str:
                     + _df_to_compact_table(data.excessive_incoming_pos))
     sections.append("\n### MASSIVE OVERSTOCK WITH VALID INBOUND PO\n"
                     "Highest-dollar incoming-overstock positions. `exposure_sy` =\n"
-                    "inventory_sy + on_order_sy. Every row needs an `[OVERSTOCK RISK]`\n"
-                    "bullet calling for the inbound PO to be defused.\n\n"
+                    "inventory_sy + on_order_sy.\n\n"
                     + _df_to_compact_table(data.massive_overstock))
-    sections.append("\n### AGING INVENTORY (clearance shortlist — no inbound PO action)\n"
-                    "v5.0: per-CC sections show the top 2 of these as `[CLEARANCE]`\n"
-                    "bullets. Use this cross-portfolio view only if you need wider\n"
-                    "context on what is aging across the business.\n\n"
-                    + _df_to_compact_table(data.aging_inventory))
 
     return "\n".join(sections)
 

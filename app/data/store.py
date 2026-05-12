@@ -16,6 +16,7 @@ _TARGETS_FILE = APPDATA_DIR / "stockturn_targets.json"
 _SNOOZE_FILE = APPDATA_DIR / "snooze.json"
 _LAUNCH_FILE = APPDATA_DIR / "launch_dates.json"
 _BRIEF_SNAPSHOTS_FILE = APPDATA_DIR / "brief_snapshots.json"
+_FEATURED_CC_FILE = APPDATA_DIR / "featured_cc_rotation.json"
 
 _DEFAULT_TARGET = 4.0
 
@@ -211,6 +212,42 @@ def save_brief_snapshot(target_date: date, skus: set[str]) -> None:
         for stale_key in sorted(data.keys())[:-_BRIEF_SNAPSHOT_RETENTION]:
             data.pop(stale_key, None)
     _save(_BRIEF_SNAPSHOTS_FILE, data)
+
+
+# ---------------------------------------------------------------------------
+# Featured Cost Center rotation (v5.1) — one CC per brief day, cycling through
+# every CC then wrapping back to the top. State is { last_date, last_cc }.
+# ---------------------------------------------------------------------------
+
+def get_next_featured_cc(target_date: date, all_ccs_sorted: list[str]) -> str:
+    """Return the cost-center code to feature on ``target_date``.
+
+    Rotation rules:
+      - Same `target_date` re-runs return the SAME featured CC (idempotent).
+      - A new `target_date` advances one slot in the sorted CC list, wrapping
+        around when it reaches the end.
+    Returns "" if no CCs are available.
+    """
+    if not all_ccs_sorted:
+        return ""
+    state = _load(_FEATURED_CC_FILE) or {}
+    last_date = state.get("last_date")
+    last_cc = state.get("last_cc") or ""
+    target_iso = target_date.isoformat()
+
+    # Idempotent for re-runs on the same day.
+    if last_date == target_iso and last_cc in all_ccs_sorted:
+        return last_cc
+
+    if last_cc in all_ccs_sorted:
+        idx = (all_ccs_sorted.index(last_cc) + 1) % len(all_ccs_sorted)
+    else:
+        idx = 0
+    next_cc = all_ccs_sorted[idx]
+    state["last_date"] = target_iso
+    state["last_cc"] = next_cc
+    _save(_FEATURED_CC_FILE, state)
+    return next_cc
 
 
 # ---------------------------------------------------------------------------
