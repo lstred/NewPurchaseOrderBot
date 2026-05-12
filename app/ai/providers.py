@@ -84,13 +84,17 @@ def call_openai(api_key: str, model: str, system: str, messages) -> str:
     # Reasoning models also need a much larger token ceiling because their
     # reasoning tokens are billed against the same budget as the visible reply.
     if is_reasoning:
-        # Reasoning models spend most of their token budget on hidden reasoning
-        # tokens; the visible reply only gets what's left.  A 1500-token brief
-        # can easily need 30k+ reasoning tokens behind it, so we set a generous
-        # ceiling.  Also ask the API to keep reasoning effort modest so more of
-        # the budget reaches the visible output.
-        body["max_completion_tokens"] = 32000
-        body["reasoning_effort"] = "medium"
+        # Reasoning models bill hidden "thinking" tokens against the same
+        # completion budget as the visible reply.  With default effort, gpt-5
+        # routinely burns 20k+ reasoning tokens on a 1.5k-token brief and can
+        # take 5+ minutes to respond — long enough to trip read timeouts and
+        # produce empty visible output.  Pin reasoning effort to its lowest
+        # setting so the model behaves like a fast chat model and most of the
+        # token budget reaches the visible reply.
+        #   - gpt-5 supports "minimal" (fastest)
+        #   - o-series only supports low/medium/high → fall back to "low"
+        body["max_completion_tokens"] = 16000
+        body["reasoning_effort"] = "minimal" if m.startswith("gpt-5") else "low"
     else:
         body["temperature"] = 0
         body["max_tokens"] = 2000
@@ -98,9 +102,9 @@ def call_openai(api_key: str, model: str, system: str, messages) -> str:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
-    # Reasoning models can spend several minutes “thinking” before the first
-    # byte of the response — give them headroom so the UI doesn't time out.
-    timeout = 600 if is_reasoning else 180
+    # Belt-and-suspenders: even with minimal reasoning effort, give reasoning
+    # models a generous read timeout so transient slow responses don't fail.
+    timeout = 900 if is_reasoning else 180
     resp = _post_json("https://api.openai.com/v1/chat/completions", headers, body, timeout=timeout)
     try:
         choice = resp["choices"][0]
