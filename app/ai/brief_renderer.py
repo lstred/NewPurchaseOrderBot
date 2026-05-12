@@ -32,20 +32,22 @@ _OL_RE      = re.compile(r"^\s*\d+[.)]\s+")
 # the model glued together.
 _INLINE_OL_RE = re.compile(r"(?<!\d)(\d+)[.)]\s+")
 # Action tags the model can prefix bullets with for visual cues.
+# v4.9: canonical tags are [OVERSTOCK RISK], [REORDER], [CLEARANCE], [NEW].
+# Legacy single-word aliases (CANCEL / DEFER / HOLD) are still recognised so
+# any cached brief still renders nicely; they all map to the overstock pill.
 _ACTION_TAG_RE = re.compile(
-    r"\[(NEW|CANCEL|DEFER|EXPEDITE|REORDER|CLEARANCE|WATCH|REVIEW|HOLD)\]"
+    r"\[(OVERSTOCK RISK|NEW|REORDER|CLEARANCE|CANCEL|DEFER|HOLD)\]"
 )
 
 _ACTION_TAG_CLASS = {
-    "NEW":       "act-new",
-    "CANCEL":    "act-cancel",
-    "DEFER":     "act-cancel",
-    "HOLD":      "act-cancel",
-    "EXPEDITE":  "act-expedite",
-    "REORDER":   "act-reorder",
-    "CLEARANCE": "act-clearance",
-    "WATCH":     "act-watch",
-    "REVIEW":    "act-watch",
+    "OVERSTOCK RISK": "act-overstock",
+    "NEW":            "act-new",
+    "REORDER":        "act-reorder",
+    "CLEARANCE":      "act-clearance",
+    # Legacy aliases — same red pill as OVERSTOCK RISK.
+    "CANCEL":         "act-overstock",
+    "DEFER":          "act-overstock",
+    "HOLD":           "act-overstock",
 }
 
 
@@ -59,10 +61,10 @@ def _inline(s: str) -> str:
     s = _BOLD_RE.sub(r"<strong>\1</strong>", s)
     s = _ITALIC_RE.sub(r"<em>\1</em>", s)
     s = _CODE_RE.sub(r"<code>\1</code>", s)
-    # Action-tag pills — must run AFTER html.escape so the literal `[CANCEL]`
+    # Action-tag pills — must run AFTER html.escape so the literal `[OVERSTOCK RISK]`
     # text from the model is converted to a styled pill.
     s = re.sub(
-        r"\[(NEW|CANCEL|DEFER|EXPEDITE|REORDER|CLEARANCE|WATCH|REVIEW|HOLD)\]",
+        r"\[(OVERSTOCK RISK|NEW|REORDER|CLEARANCE|CANCEL|DEFER|HOLD)\]",
         lambda m: _action_pill(m.group(1)),
         s,
     )
@@ -348,11 +350,10 @@ def _build_css(mode: str) -> str:
         vertical-align: 1px;
         border: 1px solid transparent;
     }}
+    .action-pill.act-overstock {{ background: #fef2f2; color: #b91c1c; border-color: #fecaca; }}
     .action-pill.act-cancel    {{ background: #fef2f2; color: #b91c1c; border-color: #fecaca; }}
-    .action-pill.act-expedite  {{ background: #fff7ed; color: #c2410c; border-color: #fed7aa; }}
     .action-pill.act-reorder   {{ background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }}
     .action-pill.act-clearance {{ background: #faf5ff; color: #7e22ce; border-color: #e9d5ff; }}
-    .action-pill.act-watch     {{ background: #f1f5f9; color: #475569; border-color: #cbd5e1; }}
     .action-pill.act-new       {{ background: #ecfdf5; color: #047857; border-color: #6ee7b7; box-shadow: 0 0 0 1px rgba(16,185,129,0.18); }}
     code {{
         background: #f1f5f9;

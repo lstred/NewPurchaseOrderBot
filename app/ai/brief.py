@@ -525,6 +525,7 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
     data.dead_stock                   = _empty
     data.receipts_pushed_to_overstock = _empty
     data.oversized_pos_vs_demand      = _empty  # subsumed by incoming_overstock
+    data.pos_arriving_after_stockout  = _empty  # v4.9: expedite not actionable
 
     # ------------------------------ Top concerns + per-CC grouping ------------------------------
     data.top_concerns = _build_top_concerns(data, sm)
@@ -663,11 +664,14 @@ def _build_actionable_metrics(
     # 3. Red-flag NEW POs entered yesterday on already-overstocked SKUs --------
     if not data.yesterday_new_pos.empty and "days_of_inventory_projected" in data.yesterday_new_pos.columns:
         yp = data.yesterday_new_pos.copy()
-        # Anything pushing past 365 days OR landing on already-overstock SKU
-        overstock_set = set(sm[sm["overstock_flag"]]["sku"])
+        # v4.9 — honour the same overstock threshold the rest of the brief uses.
+        # A PO entered yesterday is only "red flag" if its arrival pushes DOI
+        # past the actionable overstock floor.  Items merely landing on a SKU
+        # that already has the overstock_flag (which can mean DOI as low as
+        # ~180 days) are not actionable today and were the source of the
+        # CC 010 < 700-DOI rows the buyer flagged on the v4.8 brief.
         yp_flag = yp[
-            (yp["days_of_inventory_projected"].fillna(0) > 365)
-            | (yp["sku"].isin(overstock_set))
+            yp["days_of_inventory_projected"].fillna(0) > _INCOMING_OVERSTOCK_DOI_DAYS
         ].copy()
         if not yp_flag.empty:
             yp_flag = yp_flag.sort_values(
@@ -793,10 +797,9 @@ def _build_actionable_metrics(
 # survive in `data.aging_inventory` for use as a CC-section CLEARANCE fallback
 # only when a CC has no actionable items.
 _CONCERN_SEVERITY = {
-    "redflag_new_po":      96,  # PO entered yesterday, worsens overstock
-    "incoming_overstock":  92,  # valid open PO pushes DOI > 700d (cancel/defer)
-    "po_late":             90,  # valid PO arriving AFTER stockout (expedite/bridge)
-    "needs_reorder":       88,  # has demand, no valid PO on the books (place a PO)
+    "redflag_new_po":      96,  # PO entered yesterday, pushes DOI > 700d
+    "incoming_overstock":  92,  # valid open PO pushes DOI > 700d
+    "needs_reorder":       88,  # has demand, no valid PO on the books
     "clearance":           40,  # fallback only — aged on-hand stock, no inbound
 }
 
@@ -835,23 +838,21 @@ def _concern_rows(data: BriefData) -> pd.DataFrame:
                 "impact":           float(r.get(impact_col, 0) or 0),
             })
 
-    _emit(data.pos_arriving_after_stockout, "po_late",
-          "Expedite PO or place an emergency PO — inbound supply lands AFTER stockout.")
     _emit(data.redflag_new_pos, "redflag_new_po",
-          "Review/cancel PO entered yesterday — it worsens an already-overstocked SKU.",
+          "Overstock risk — PO entered yesterday pushes DOI past 700 days.",
           impact_col="qty_native")
     _emit(data.needs_reorder_no_po, "needs_reorder",
           "Place a new PO — active demand, no open PO, cover < 1.5x lead time.",
           impact_col="suggested_order_sy")
     _emit(data.excessive_incoming_pos, "incoming_overstock",
-          "Defer or cancel the open PO — arrival pushes DOI past 700 days.",
+          "Overstock risk — open PO arrival pushes DOI past 700 days.",
           impact_col="on_order_sy")
     # massive_overstock is wired in as a richer-attribute alias of
     # incoming_overstock when the same SKU also clears the exposure threshold.
     # We emit it under the `incoming_overstock` concern so the buyer sees one
     # consolidated row per SKU, but use exposure_sy as the ranking impact.
     _emit(data.massive_overstock, "incoming_overstock",
-          "Defer or cancel inbound — huge cash position with multi-year cover.",
+          "Overstock risk — huge cash position with multi-year projected cover.",
           impact_col="exposure_sy")
     # CLEARANCE fallback — emitted only so it can show in CC sections that have
     # no actionable items. Filtered out of top_concerns by the severity floor.
@@ -883,7 +884,7 @@ def _build_top_concerns(
     """Pick every SKU/concern combination at or above the severity floor.
 
     v4.8 — only the actionable concern types survive (`incoming_overstock`,
-    `redflag_new_po`, `po_late`, `needs_reorder`); `clearance` (severity 40)
+    `redflag_new_po`, `needs_reorder`); `clearance` (severity 40)
     is excluded by the floor and only ever appears as a per-CC fallback in
     `_build_cost_center_breakdown`.
     """
@@ -906,7 +907,7 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
       - `incoming_overstock`  (valid open PO that pushes DOI > 700d, plus
         `redflag_new_pos` and the rich-attribute `massive_overstock` overlay)
       - `needs_reorder`       (must place / expedite a PO; combines
-        `needs_reorder_no_po` and `pos_arriving_after_stockout`)
+        `needs_reorder_no_po`)
     A CC with zero rows in EITHER bucket falls back to a single `clearance`
     bullet list drawn from `aging_inventory`. This matches the buyer's
     instruction — don't show clearance unless there's literally nothing else.
@@ -928,10 +929,12 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
         ("massive_overstock",       data.massive_overstock),
         ("redflag_new_pos",         data.redflag_new_pos),
     ]
-    # Bucket 2 — reorder / expedite (active demand that needs a buy).
+    # Bucket 2 — reorder (active demand that needs a NEW PO placed).
+    # v4.9: dropped `pos_arriving_after_stockout` (expedite is not actionable
+    # for this team — lead time is fixed and a bridge buy already surfaces
+    # via `needs_reorder_no_po`).
     reorder_specs = [
         ("needs_reorder",                data.needs_reorder_no_po),
-        ("pos_arriving_after_stockout",  data.pos_arriving_after_stockout),
     ]
     # Fallback bucket — only used if both action buckets are empty for a CC.
     fallback_specs = [
@@ -1101,15 +1104,17 @@ def build_brief_prompt(data: BriefData) -> str:
 
     # --- TOP CONCERNS (the lead) -------------------------------------------------
     sections.append(
-        "\n## TOP CONCERNS (v4.8 — only buyer-actionable items)\n"
+        "\n## TOP CONCERNS (v4.9 — only buyer-actionable items)\n"
         "Every row is one of TWO action types:\n"
         "  - `incoming_overstock` / `redflag_new_po`: an OPEN, valid PO is\n"
-        "    pushing days-of-inventory past 700 — cancel or defer the inbound.\n"
-        "  - `needs_reorder` / `po_late`: active demand that requires a NEW\n"
-        "    PO or expedite — the buyer must place / accelerate supply.\n"
+        "    pushing days-of-inventory past 700 — flag as OVERSTOCK RISK.\n"
+        "  - `needs_reorder`: active demand with no valid PO on the books —\n"
+        "    the buyer must place a NEW PO.\n"
         "Pure on-hand overstock without inbound is intentionally NOT in this\n"
-        "list (no buyer action available beyond markdown). Placeholder POs\n"
-        "with 1-2 char order numbers were stripped upstream.\n"
+        "list (no buyer action available beyond markdown). Late-PO/expedite\n"
+        "items are also excluded — lead time is fixed; if a bridge buy is\n"
+        "needed it surfaces via needs_reorder. Placeholder POs with 1-2 char\n"
+        "order numbers were stripped upstream.\n"
         "\n`is_new` column = True if this SKU did not appear in the previous\n"
         "day's brief. Render `[NEW]` immediately after the action tag for those\n"
         "rows so the buyer can spot fresh items vs the usual offenders.\n"
@@ -1168,9 +1173,7 @@ def build_brief_prompt(data: BriefData) -> str:
         "Every table below is filtered to v4.8's two action buckets only.\n"
         "Use them only if you need to verify or expand on the per-CC sections.\n"
     )
-    sections.append("\n### POs ARRIVING AFTER STOCKOUT (lead time > days_until_stockout)\n"
-                    + _df_to_compact_table(data.pos_arriving_after_stockout))
-    sections.append("\n### RED-FLAG NEW POs (entered yesterday, push DOI > 700d or land on overstock)\n"
+    sections.append("\n### RED-FLAG NEW POs (entered yesterday, push DOI > 700d)\n"
                     + _df_to_compact_table(data.redflag_new_pos))
     sections.append("\n### NEEDS REORDER — no valid PO on the books, cover < 1.5x lead time\n"
                     "`suggested_order_sy` = 60-day cover target net of current inventory.\n\n"
@@ -1179,8 +1182,8 @@ def build_brief_prompt(data: BriefData) -> str:
                     + _df_to_compact_table(data.excessive_incoming_pos))
     sections.append("\n### MASSIVE OVERSTOCK WITH VALID INBOUND PO\n"
                     "Highest-dollar incoming-overstock positions. `exposure_sy` =\n"
-                    "inventory_sy + on_order_sy. Every row needs `[CANCEL]` or `[DEFER]`\n"
-                    "of the inbound PO.\n\n"
+                    "inventory_sy + on_order_sy. Every row needs an `[OVERSTOCK RISK]`\n"
+                    "bullet calling for the inbound PO to be defused.\n\n"
                     + _df_to_compact_table(data.massive_overstock))
     sections.append("\n### AGING INVENTORY (clearance fallback only — no inbound PO action)\n"
                     "Use ONLY in CC sections where there are no incoming-overstock\n"
