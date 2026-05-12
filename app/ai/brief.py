@@ -20,7 +20,6 @@ Architecture:
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -305,7 +304,10 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
     # SKUs with zero inventory but real demand — the second business priority.
     so = sm[sm["stockout_flag"] & (sm["avg_daily_sales_sy"] > 0)].copy()
     if not so.empty:
-        so = so.sort_values("avg_daily_sales_sy", ascending=False).head(30)[
+        # v4.7: severity-floor — emit ALL rows with meaningful daily demand
+        # (>= 1 SY/day), not just the top-30 by velocity. Safety ceiling 80.
+        so = so[so["avg_daily_sales_sy"] >= 1.0]
+        so = so.sort_values("avg_daily_sales_sy", ascending=False).head(80)[
             ["sku", "sku_description", "avg_daily_sales_sy", "on_order_sy",
              "lead_time_days", "days_since_last_sale", "supplier_number",
              "price_class_desc", "cost_center"]
@@ -318,7 +320,9 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         rr["days_until_stockout"] = rr["days_until_stockout"].replace(
             [float("inf"), float("-inf")], None
         )
-        rr = rr.sort_values("days_until_stockout", ascending=True).head(30)[
+        # v4.7: emit ALL rows projected to run out within their lead time,
+        # capped at 80 for prompt size.
+        rr = rr.sort_values("days_until_stockout", ascending=True).head(80)[
             ["sku", "sku_description", "inventory_sy", "on_order_sy",
              "avg_daily_sales_sy", "days_until_stockout", "lead_time_days",
              "supplier_number", "price_class_desc", "cost_center"]
@@ -342,7 +346,10 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         # Sort by cash exposure first (inv + on_order), then DOI_proj — so the
         # biggest cash positions never get cut by the head(30) cap.
         ov["_exposure"] = ov["inventory_sy"].fillna(0) + ov["on_order_sy"].fillna(0)
-        ov = ov.sort_values(["_exposure", "days_of_inventory_projected"], ascending=[False, False]).head(30)[
+        # v4.7: severity-floor — keep every row with meaningful exposure
+        # (>= 1,000 SY combined) so HAL/ROSALIE-class items always surface.
+        ov = ov[ov["_exposure"] >= 1000.0]
+        ov = ov.sort_values(["_exposure", "days_of_inventory_projected"], ascending=[False, False]).head(100)[
             ["sku", "sku_description", "inventory_sy", "on_order_sy",
              "avg_daily_sales_sy", "days_of_inventory", "days_of_inventory_projected",
              "stockturn_target", "supplier_number", "price_class_desc", "cost_center"]
@@ -355,7 +362,9 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         (sm["inventory_age_days"] >= 365) & (sm["inventory_sy"] > 0)
     ].copy()
     if not aging.empty:
-        aging = aging.sort_values("inventory_age_days", ascending=False).head(30)[
+        # v4.7: severity-floor — keep every aged SKU with >= 250 SY on hand.
+        aging = aging[aging["inventory_sy"] >= 250.0]
+        aging = aging.sort_values("inventory_age_days", ascending=False).head(80)[
             ["sku", "sku_description", "inventory_sy", "inventory_age_days",
              "avg_daily_sales_sy", "days_since_last_sale", "on_order_sy",
              "supplier_number", "price_class_desc", "cost_center"]
@@ -375,7 +384,10 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         )
         # Same exposure-first sort as overstock_with_open_po so big cash items lead.
         inc["_exposure"] = inc["inventory_sy"].fillna(0) + inc["on_order_sy"].fillna(0)
-        inc = inc.sort_values(["_exposure", "days_of_inventory_projected"], ascending=[False, False]).head(30)[
+        # v4.7: severity-floor — keep every incoming-overstock SKU with >= 1,000
+        # SY combined exposure.
+        inc = inc[inc["_exposure"] >= 1000.0]
+        inc = inc.sort_values(["_exposure", "days_of_inventory_projected"], ascending=[False, False]).head(100)[
             ["sku", "sku_description", "inventory_sy", "on_order_sy",
              "avg_daily_sales_sy", "days_of_inventory_projected", "supplier_number",
              "price_class_desc", "cost_center"]
@@ -424,8 +436,11 @@ def gather_brief_data(target_date: date, bundle: DatasetBundle) -> BriefData:
         mo["days_of_inventory_projected"] = mo["days_of_inventory_projected"].replace(
             [float("inf"), float("-inf")], None
         )
-        # Top 40 portfolio-wide so big positions in mid-tier CCs aren't starved
-        mo = mo.sort_values("exposure_sy", ascending=False).head(40)[
+        # v4.7: severity-floor — emit ALL rows that meet the threshold, capped
+        # only at a safety ceiling of 150 to keep the prompt under 200 KB.
+        # Previously head(40); HAL/ROSALIE-class mid-tier positions were being
+        # starved out by larger CCs.
+        mo = mo.sort_values("exposure_sy", ascending=False).head(150)[
             ["sku", "sku_description", "inventory_sy", "on_order_sy", "exposure_sy",
              "avg_daily_sales_sy", "days_of_inventory", "days_of_inventory_projected",
              "inventory_age_days", "supplier_number", "price_class_desc", "cost_center"]
@@ -742,13 +757,24 @@ def _concern_rows(data: BriefData) -> pd.DataFrame:
     return df
 
 
-def _build_top_concerns(data: BriefData, sm: pd.DataFrame, top_n: int = 25) -> pd.DataFrame:
-    """Pick the top-N most-urgent SKU/concern combinations across the portfolio.
+def _build_top_concerns(
+    data: BriefData,
+    sm: pd.DataFrame,
+    severity_floor: float = 80.0,
+    safety_ceiling: int = 120,
+) -> pd.DataFrame:
+    """Pick every SKU/concern combination at or above the severity floor.
 
-    Diversity quota: no single concern type may consume more than 6 slots.
-    Within a tier we prefer higher impact and larger inventory.  This stops one
-    noisy concern (e.g. 15 small `po_late` items) from crowding out genuine
-    high-impact items of other types.
+    v4.7 — SEVERITY-FLOOR semantics (replaces v4.6 row caps):
+      - Emit EVERY row with effective severity >= ``severity_floor`` (default
+        80, which covers po_late, redflag_new_po, massive_overstock, stockout,
+        needs_reorder, receipt_to_overstock, oversized_po, incoming_overstock).
+      - No per-concern diversity quota — if the data shows 30 massive_overstock
+        items above the floor, the buyer sees all 30. The previous quota was
+        starving HAL/ROSALIE-class items out of the leader board.
+      - Hard safety ceiling of ``safety_ceiling`` rows so the prompt stays
+        under ~200 KB even on extreme days.
+      - Within the floor, sorted by severity desc, then impact desc.
     """
     df = _concern_rows(data)
     if df.empty:
@@ -756,14 +782,11 @@ def _build_top_concerns(data: BriefData, sm: pd.DataFrame, top_n: int = 25) -> p
     df = df.sort_values(
         ["severity", "impact", "inventory_sy"], ascending=[False, False, False]
     )
-    # Dedup so a single SKU only shows once at the top — keep its top concern.
+    # One row per SKU — keep its highest-severity concern.
     df = df.drop_duplicates(subset=["sku"], keep="first")
-
-    # Diversity cap: at most _MAX_PER_CONCERN per concern type in the leader board
-    _MAX_PER_CONCERN = 6
-    df["_rank_in_kind"] = df.groupby("concern").cumcount()
-    df = df[df["_rank_in_kind"] < _MAX_PER_CONCERN].drop(columns="_rank_in_kind")
-    return df.head(top_n).reset_index(drop=True)
+    # Severity-floor filter — the architectural change in v4.7.
+    df = df[df["severity"] >= severity_floor]
+    return df.head(safety_ceiling).reset_index(drop=True)
 
 
 def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
@@ -805,7 +828,7 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
                 "tables": {},
                 "kpis":   {},
             })
-            slot["tables"][name] = sub.head(15).reset_index(drop=True)
+            slot["tables"][name] = sub.head(40).reset_index(drop=True)
 
     # Per-CC massive overstock overlay (v4.5) -------------------------------
     # The global `data.massive_overstock` is capped at 20 portfolio-wide, which
@@ -839,7 +862,7 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
                 cc_str = str(cc or "").strip() or "(unassigned)"
                 if cc_str not in out:
                     continue  # only attach to CCs that already have other concerns
-                top_local = sub.sort_values("exposure_sy", ascending=False).head(15).reset_index(drop=True)
+                top_local = sub.sort_values("exposure_sy", ascending=False).head(40).reset_index(drop=True)
                 # Don't shadow the global table if it's already richer than the local one
                 existing = out[cc_str]["tables"].get("massive_overstock")
                 if existing is None or len(top_local) > len(existing):
@@ -867,7 +890,7 @@ def _build_cost_center_breakdown(data: BriefData, sm: pd.DataFrame) -> dict:
 # Prompt construction
 # ---------------------------------------------------------------------------
 
-def _df_to_compact_table(df: pd.DataFrame, max_rows: int = 30) -> str:
+def _df_to_compact_table(df: pd.DataFrame, max_rows: int = 100) -> str:
     """Render a DataFrame as a compact pipe-delimited table (cheap for tokens)."""
     if df is None or df.empty:
         return "(none)"
@@ -927,11 +950,15 @@ def build_brief_prompt(data: BriefData) -> str:
 
     # --- TOP CONCERNS (the lead) -------------------------------------------------
     sections.append(
-        "\n## TOP CONCERNS (ranked — cross-portfolio)\n"
-        "These are the highest-severity SKU/issue combinations across the entire eligible\n"
-        "portfolio. Severity-tiered then ranked by impact. Each row already includes a\n"
-        "specific recommended action — quote it verbatim or refine.\n\n"
-        + _df_to_compact_table(data.top_concerns, max_rows=25)
+        "\n## TOP CONCERNS (severity-floor — every row >= sev 80)\n"
+        "These are EVERY SKU/issue combination across the entire eligible\n"
+        "portfolio at or above severity 80 (po_late, redflag_new_po,\n"
+        "massive_overstock, stockout, needs_reorder, receipt_to_overstock,\n"
+        "oversized_po, incoming_overstock). v4.7 dropped the row cap so HAL/\n"
+        "ROSALIE-class mid-tier positions are no longer starved out. Every row\n"
+        "already includes a specific recommended action — quote it verbatim or\n"
+        "refine, but DO NOT skip rows.\n\n"
+        + _df_to_compact_table(data.top_concerns, max_rows=120)
     )
 
     # --- Yesterday's activity ----------------------------------------------------
@@ -974,7 +1001,9 @@ def build_brief_prompt(data: BriefData) -> str:
                 f"| Overstock={kpis.get('overstock', 0)} | Aged={kpis.get('aging', 0)}\n"
             )
             for tname, tdf in tables.items():
-                sections.append(f"\n#### {tname}\n" + _df_to_compact_table(tdf, max_rows=8))
+                # v4.7: render up to 40 rows per per-CC table (was 8). The AI
+                # is mandated to bullet every massive_overstock row.
+                sections.append(f"\n#### {tname}\n" + _df_to_compact_table(tdf, max_rows=40))
 
     # --- Cross-portfolio problem tables (fallback context) ----------------------
     sections.append("\n## DEEPER ACTIONABLE METRICS (cross-portfolio)\n")

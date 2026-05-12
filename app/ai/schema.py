@@ -59,9 +59,14 @@ FORMATTING RULES (mandatory — the renderer is strict):
 the two priorities is doing today (good / mixed / poor) and why.
 
 ## Top Concerns
-The 5-10 highest-impact, ACTIONABLE items across the entire portfolio. Use the
-TOP CONCERNS table from the data as your starting point — but write them as
-proper bullets the buyer can act on, not a copy of the table.
+The data's `TOP CONCERNS` table is now a SEVERITY-FLOOR slice (v4.7) — every
+row has effective severity >= 80. There is NO row cap; if the data shows 50
+rows, the buyer expects to see all 50 covered.
+
+Write ONE bullet per row in TOP CONCERNS, in the same order as the data.
+DO NOT summarize, deduplicate, or skip rows. The previous behaviour of
+cherry-picking 5-10 "highlights" caused real cash positions (HAL/ROSALIE
+class) to be dropped — that is no longer acceptable.
 
 This section is **portfolio-wide ranking** — items here are ordered purely by
 severity and impact, regardless of cost center. The same items will reappear
@@ -84,12 +89,12 @@ overstocked". Those are useless. Name the specific SKUs and specific actions.
 
 MANDATORY MASSIVE-OVERSTOCK COVERAGE: every row in the data's `MASSIVE OVERSTOCK`
 table represents a very large cash position (3,000+ SY combined, 18+ months of
-cover or dead-with-inbound). At least one bullet in Top Concerns MUST address
-each of the top 5 rows of that table when present, even if other concerns rank
-above them numerically. Furthermore, EVERY cost center section that has a
-`massive_overstock` table MUST address its top 5 rows with explicit
-[CANCEL]/[DEFER]/[CLEARANCE] bullets — these are the largest dollar exposures
-in each CC and must never be silently skipped.
+cover or dead-with-inbound). v4.7 emits up to 150 such rows portfolio-wide and
+up to 40 per CC — the AI MUST render EVERY ROW of every CC's `massive_overstock`
+table as its own [CANCEL]/[DEFER]/[CLEARANCE] bullet. No summarising, no
+"and several others", no skipping. If a CC's massive_overstock table has 22
+rows, write 22 bullets in that CC's section. The buyer reads this brief to
+find the exact SKUs that need action — missing one defeats the purpose.
 
 ## Yesterday's Notable Changes
 Only call out yesterday's POs / receipts / backorders / sales that meaningfully
@@ -102,14 +107,12 @@ Concerns appears here with its full local context — plus any CC-specific
 issues that didn't make the portfolio-wide top.)"*
 
 For each cost center listed in the PER-COST-CENTER BREAKDOWN section of the
-data, render a `## CC <code> — <name>` heading FOLLOWED by 5-12 specific,
-actionable bullets drawn from THAT cost center's tables. Each bullet follows
-the same format as Top Concerns (specific SKU, what's wrong, what to do, why)
-but WITHOUT the [CC xxx] prefix (the section heading already states the CC).
-Aim for THOROUGH coverage — a buyer expects to see every meaningful issue in
-their CC, not a sampler. If a CC's tables hold 8+ distinct actionable items,
-write 8+ bullets. Never artificially cap a CC at 3-4 bullets when the data
-shows more.
+data, render a `## CC <code> — <name>` heading followed by a bullet for EVERY
+actionable row in that CC's tables. Each bullet follows the same format as Top
+Concerns (specific SKU, what's wrong, what to do, why) but WITHOUT the [CC xxx]
+prefix (the section heading already states the CC). v4.7: there is NO upper
+bound — if a CC has 25 actionable rows across its tables, write 25 bullets.
+Never summarise ("plus several other slow movers"); name every SKU.
 
 MANDATORY: every cost center that appears in any Top Concern bullet MUST have
 its own section here — never leave a CC mentioned at the top with no section
@@ -126,10 +129,11 @@ the data (active demand, zero open PO, short cover) AND the per-CC
 must see explicit action on both.
 
 ## Recommended Actions (top 5)
-Numbered list (real Markdown, ONE item per line beginning with `1. `, `2. `,
-etc. — NEVER as a single paragraph), ranked by urgency. Each item starts with
-an action tag, then the specific SKU/PO#/supplier and an estimated $ or SY
-impact. These are actions the buyer can execute today.
+Numbered list — EXACTLY 5 items, EACH on its OWN single line. Format each line
+literally as `1. [TAG] SKU (CC nnn) — verb + target + impact.` (one line, no
+embedded newlines, no line breaks inside parentheses). DO NOT split the action
+from its rationale onto a second line — the renderer will create a broken
+bullet. Ranked by urgency. These are actions the buyer can execute today.
 
 TONE & STYLE:
   - Direct. Buyer-grade. No hedging unless the data is genuinely ambiguous.
