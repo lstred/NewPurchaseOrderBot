@@ -16,6 +16,7 @@ SELECT
     LTRIM(RTRIM(i.IPRODL))                 AS product_line,
     LTRIM(RTRIM(i.IMFGR))                  AS manufacturer,
     LTRIM(RTRIM(i.IPATT))                  AS item_pattern,
+    LTRIM(RTRIM(COALESCE(i.ICLAST, '')))   AS iclast,
     CAST(COALESCE(NULLIF(i.IDELIV, 0), 0) AS INT) AS item_lead_time_days,
     COALESCE(CAST(i.IWIDTH AS FLOAT), 0)   AS item_width_inches,
     COALESCE(p.[$DESC], '')                AS price_class_desc,

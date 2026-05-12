@@ -322,6 +322,9 @@ def _compute_sku_metrics(
     # but aggregation DataFrames may carry any residual padding from cache.
     items = items.copy()
     items["base_sku"] = items["base_sku"].str.strip()
+    # Defensive: older cached items frames may not carry ICLAST yet.
+    if "iclast" not in items.columns:
+        items["iclast"] = ""
     for _agg in (sales_agg, inv_agg, po_agg, pend_agg):
         if not _agg.empty and "base_sku" in _agg.columns:
             _agg["base_sku"] = _agg["base_sku"].str.strip()
@@ -341,6 +344,7 @@ def _compute_sku_metrics(
             "base_sku", "sku_description", "cost_center", "price_class",
             "price_class_desc", "supplier_number", "product_line",
             "product_line_desc", "item_lead_time_days", "product_line_lead_time_days",
+            "iclast",
         ]
     ].copy()
 
